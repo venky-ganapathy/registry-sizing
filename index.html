@@ -1,0 +1,1324 @@
+<title>Registry - Hardware Sizing and Estimation</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&family=Roboto+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: 3 equal-width node-level boxes stacked (Reverse Proxy / Compute / Storage),
+   center-aligned so the RP->Compute connector is a straight vertical line (Compute
+   does NOT connect to Storage directly -- every pod already routes through PgBouncer).
+   Compute Node: 7 pod columns -- UI / API / Celery Beat / Celery Worker (workload-type
+   split) -- then the 3 third-party columns (uses-Postgres / uses-NFS / no-persistence).
+   Storage Node: PgBouncer sits directly above Postgres at the SAME width AND is
+   x-centered between the Postgres-feeding columns (API, Celery Beat, Celery Worker,
+   3rd-party-Postgres), so the merged arrow and PgBouncer->Postgres are both pure
+   vertical lines BY CONSTRUCTION (mergeX is literally defined as PgBouncer's own
+   center -- see buildDiagram()). NFS sits beside Postgres, with one single straight
+   vertical arrow in, landing within its top edge. Postgres's own disk is a separate
+   Direct-Attached Storage box -- it does not use NFS.
+   Palette: Architecture tab uses ONLY the 5 OpenG2P Brand Guide V2 colors -- black
+   #161616, grey #969696, orange #f48020, off-white #fafafa, gold #fdc30d -- plus
+   tints/shades of those same 5 (never an invented hue) so several independent pod
+   dimensions can be color-coded at once:
+     - workload type (UI / API / Celery Beat / Celery Worker / 3rd-party-*) -> column position
+     - OpenG2P vs Non-OpenG2P pod                                           -> fill color (orange-tint / grey-tint)
+     - Guaranteed vs Burstable QoS                                         -> border color (black / grey)
+     - measured vs assumed                                                  -> tag pill (black-on-white / gold-on-black)
+   In the API / Celery Beat / Celery Worker columns specifically, every pod is
+   OpenG2P-built (registry or commons), so the origin-based fill above would be
+   uniform there and waste that channel -- fill is repurposed in just those three
+   columns to carry QoS x measured/assumed instead (4 combinations; border still
+   carries QoS alone too, so the three combinations that actually occur today --
+   guaranteed+measured, burstable+measured, burstable+assumed -- each render
+   visually distinct). UI and the 3rd-party columns are untouched and keep the
+   plain origin-based fill.
+   The Implementation Partner Inputs tab (now first) is NOT restricted to this
+   palette -- it's a plain input form, not part of the branded diagram. */
+:root{
+  --og-black:#161616; --og-grey:#969696; --og-orange:#f48020; --og-white:#fafafa; --og-gold:#fdc30d;
+  --bg:#fafafa; --surface:#ffffff; --ink:#1c1c1a; --ink-soft:#5c5c57; --ink-faint:#8f8f88;
+  --border:#ddddd3; --border-strong:#c2c2b6;
+  --canvas:#f3f2ec;
+
+  /* ---- tints of the 5 brand colors, light mode ---- */
+  --openg2p-bg:#fde6cc;      --openg2p-border:#f48020;
+  --nonopeng2p-bg:#ececec;   --nonopeng2p-border:#969696;
+  --landing-bg:#fef3cf;      --landing-border:#fdc30d;
+  --qos-guaranteed-border:#161616; --qos-burstable-border:#969696;
+  /* API / Celery Beat / Celery Worker columns only -- fill = QoS x measured/assumed */
+  --qtag-gm-bg:#fde6cc; --qtag-ga-bg:#f8d9a0; --qtag-bm-bg:#fdecb0; --qtag-ba-bg:#ececec;
+  /* Deliberate one-off exception to the brand-only palette above: burstable+assumed
+     OpenG2P pods in those same 3 columns would otherwise render identically to the
+     3rd-party columns (same grey fill, same grey QoS border) -- a blue border, at the
+     user's explicit request, breaks that visual collision. */
+  --qtag-ba-border:#2f6fb0;
+  --db-sub:#fdc30d;          --db-sub-bg:#fef3cf;
+  --partition-sub:#161616;   --partition-sub-bg:#e3e3e3;
+  --nodebox:#161616;         --nodebox-bg:#ececec;
+  --pg:#161616;              --pg-bg:#fafafa;
+  --pgbouncer:#161616;       --pgbouncer-bg:#ececec;
+  --das:#969696;             --das-bg:#ececec;
+  --storage:#161616;         --storage-bg:#fafafa;
+  --arrow:#f48020;
+
+  --tag-measured-bg:#161616; --tag-measured-fg:#fafafa;
+  --tag-assumed-bg:#fdc30d;  --tag-assumed-fg:#161616;
+  --tag-guaranteed-bg:#161616; --tag-guaranteed-fg:#fafafa;
+  --tag-burstable-bg:#969696;  --tag-burstable-fg:#fafafa;
+  font-size:17.25px; /* +15% base -- every rem-based size below scales from this automatically */
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#15161a; --surface:#1d1f23; --ink:#eceae4; --ink-soft:#a9a89f; --ink-faint:#74746c;
+    --border:#33332e; --border-strong:#47473f; --canvas:#1a1b1e;
+
+    --openg2p-bg:#3a2510;      --openg2p-border:#ff9d42;
+    --nonopeng2p-bg:#2a2a2a;   --nonopeng2p-border:#b5b5b5;
+    --landing-bg:#352c0d;      --landing-border:#ffd84d;
+    --qos-guaranteed-border:#e8e8e8; --qos-burstable-border:#b5b5b5;
+    --qtag-gm-bg:#3a2510; --qtag-ga-bg:#4a3515; --qtag-bm-bg:#3d3210; --qtag-ba-bg:#2a2a2a;
+    --qtag-ba-border:#6fb3ff;
+    --db-sub:#ffd84d;          --db-sub-bg:#352c0d;
+    --partition-sub:#e8e8e8;   --partition-sub-bg:#262626;
+    --nodebox:#e8e8e8;         --nodebox-bg:#262626;
+    --pg:#e8e8e8;              --pg-bg:#1d1f23;
+    --pgbouncer:#e8e8e8;       --pgbouncer-bg:#262626;
+    --das:#b5b5b5;             --das-bg:#262626;
+    --storage:#e8e8e8;         --storage-bg:#1d1f23;
+    --arrow:#ff9d42;
+
+    --tag-measured-bg:#e8e8e8; --tag-measured-fg:#15161a;
+    --tag-assumed-bg:#ffd84d;  --tag-assumed-fg:#161616;
+    --tag-guaranteed-bg:#e8e8e8; --tag-guaranteed-fg:#15161a;
+    --tag-burstable-bg:#b5b5b5;  --tag-burstable-fg:#15161a;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#15161a; --surface:#1d1f23; --ink:#eceae4; --ink-soft:#a9a89f; --ink-faint:#74746c;
+  --border:#33332e; --border-strong:#47473f; --canvas:#1a1b1e;
+
+  --openg2p-bg:#3a2510;      --openg2p-border:#ff9d42;
+  --nonopeng2p-bg:#2a2a2a;   --nonopeng2p-border:#b5b5b5;
+  --landing-bg:#352c0d;      --landing-border:#ffd84d;
+  --qos-guaranteed-border:#e8e8e8; --qos-burstable-border:#b5b5b5;
+  --qtag-gm-bg:#3a2510; --qtag-ga-bg:#4a3515; --qtag-bm-bg:#3d3210; --qtag-ba-bg:#2a2a2a;
+  --qtag-ba-border:#6fb3ff;
+  --db-sub:#ffd84d;          --db-sub-bg:#352c0d;
+  --partition-sub:#e8e8e8;   --partition-sub-bg:#262626;
+  --nodebox:#e8e8e8;         --nodebox-bg:#262626;
+  --pg:#e8e8e8;              --pg-bg:#1d1f23;
+  --pgbouncer:#e8e8e8;       --pgbouncer-bg:#262626;
+  --das:#b5b5b5;             --das-bg:#262626;
+  --storage:#e8e8e8;         --storage-bg:#1d1f23;
+  --arrow:#ff9d42;
+
+  --tag-measured-bg:#e8e8e8; --tag-measured-fg:#15161a;
+  --tag-assumed-bg:#ffd84d;  --tag-assumed-fg:#161616;
+  --tag-guaranteed-bg:#e8e8e8; --tag-guaranteed-fg:#15161a;
+  --tag-burstable-bg:#b5b5b5;  --tag-burstable-fg:#15161a;
+  color-scheme: dark;
+}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:"Roboto",system-ui,-apple-system,"Segoe UI",sans-serif}
+.mono{font-family:"Roboto Mono",ui-monospace,Menlo,monospace}
+.topbar{border-bottom:1px solid var(--border);background:var(--surface);padding:16px 20px}
+.topbar h1{margin:0 0 2px;font-size:1.1rem;font-weight:700}
+.tabs{display:flex;gap:4px;padding:10px 20px 0;background:var(--surface);border-bottom:1px solid var(--border)}
+.tab-btn{background:none;border:none;padding:9px 16px;font-size:0.86rem;font-weight:500;color:var(--ink-faint);cursor:pointer;border-bottom:2px solid transparent;font-family:inherit}
+.tab-btn.active{color:var(--og-orange);border-bottom-color:var(--og-orange);font-weight:700}
+.tabpanel{display:none}
+.tabpanel.active{display:block}
+.wrap{max-width:1340px;margin:0 auto;padding:18px 20px 60px}
+.legend{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;margin-bottom:14px;font-size:0.78rem;color:var(--ink-soft)}
+.legend .lgroup{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;padding:6px 10px;border:1px solid var(--border);border-radius:8px}
+.legend .lgroup .lhead{font-size:0.68rem;text-transform:uppercase;letter-spacing:0.04em;color:var(--ink-faint);margin-right:2px}
+.legend .sw{display:inline-flex;align-items:center;gap:6px}
+.legend .dot{width:11px;height:11px;border-radius:3px;display:inline-block;border:2px solid transparent}
+.canvas-shell{background:var(--canvas);border:1px solid var(--border);border-radius:14px;padding:10px;overflow-x:auto}
+svg{display:block;min-width:1260px;width:100%;height:auto}
+.box{cursor:pointer}
+.box rect{stroke-width:1.6;rx:10;ry:10}
+.subbox rect{stroke-width:1.2;rx:6;ry:6}
+.box text, .subbox text{font-family:"Roboto",sans-serif;pointer-events:none}
+.t-name{font-size:10.9px;font-weight:700}
+.t-sub{font-size:9.8px}
+.box:hover rect, .subbox:hover rect{filter:brightness(0.96)}
+@media (prefers-color-scheme:dark){ .box:hover rect, .subbox:hover rect{filter:brightness(1.18)} }
+:root[data-theme="dark"] .box:hover rect, :root[data-theme="dark"] .subbox:hover rect{filter:brightness(1.18)}
+.group-label{font-size:10.9px;font-weight:700;letter-spacing:0.02em;text-transform:uppercase;fill:var(--ink-faint)}
+.node-label{font-size:14.4px;font-weight:700;letter-spacing:0.03em;fill:var(--nodebox)}
+.node-sub{font-size:11.5px;fill:var(--ink-faint)}
+.flow{stroke-dasharray:6 6;animation:dash 1.2s linear infinite}
+@keyframes dash{ to{ stroke-dashoffset:-24; } }
+
+.pop{position:fixed;z-index:50;max-width:min(560px, calc(100vw - 32px));background:var(--surface);border:1px solid var(--border-strong);
+  border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,0.18);padding:14px 16px;font-size:0.82rem;display:none}
+.pop .instance-line{white-space:nowrap;font-size:0.74rem}
+.pop.show{display:block}
+.pop h4{margin:0 0 2px;font-size:0.92rem;font-family:"Roboto Mono",monospace;word-break:break-word}
+.pop .cat{font-size:0.68rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--ink-faint);margin-bottom:8px}
+.pop .ns{display:inline-block;font-size:0.68rem;font-family:"Roboto Mono",monospace;background:var(--bg);border:1px solid var(--border);padding:1px 6px;border-radius:5px;margin-bottom:8px;color:var(--ink-soft)}
+.pop dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:4px 10px}
+.pop dt{color:var(--ink-soft)}
+.pop dd{margin:0;font-weight:600;text-align:right;font-family:"Roboto Mono",monospace;font-size:0.78rem}
+.pop .tag{display:inline-block;font-size:0.65rem;font-weight:700;padding:1px 6px;border-radius:99px;margin-top:9px}
+.pop .tag-measured{background:var(--tag-measured-bg);color:var(--tag-measured-fg)}
+.pop .tag-assumed{background:var(--tag-assumed-bg);color:var(--tag-assumed-fg)}
+.pop .tag-guaranteed{background:var(--tag-guaranteed-bg);color:var(--tag-guaranteed-fg)}
+.pop .tag-burstable{background:var(--tag-burstable-bg);color:var(--tag-burstable-fg)}
+.pop .tag + .tag{margin-left:5px}
+.pop .note{font-size:0.74rem;color:var(--ink-soft);margin-top:8px;padding-top:8px;border-top:1px dashed var(--border)}
+.pop .partlist{margin-top:6px;display:flex;flex-direction:column;gap:6px}
+.pop .partrow{display:flex;justify-content:space-between;gap:8px;font-size:0.76rem;border-bottom:1px dashed var(--border);padding-bottom:4px}
+.pop .conn-row{display:flex;flex-direction:column;align-items:flex-start;gap:2px;font-size:0.76rem;border-bottom:1px dashed var(--border);padding-bottom:4px;width:100%}
+.pop .conn-url{word-break:break-all;color:var(--ink-soft);font-size:0.72rem}
+.pop .close{position:absolute;top:8px;right:10px;background:none;border:none;color:var(--ink-faint);font-size:1rem;cursor:pointer;line-height:1}
+.overlay{position:fixed;inset:0;z-index:40;display:none}
+.overlay.show{display:block}
+footer{max-width:1340px;margin:30px auto 0;padding:16px 20px;color:var(--ink-faint);font-size:0.74rem;border-top:1px solid var(--border)}
+
+/* ---- Implementation Partner Inputs tab (plain form, not brand-restricted) ---- */
+.in-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;align-items:start}
+.in-col{display:flex;flex-direction:column;gap:16px;min-width:0}
+@media (max-width:1100px){ .in-grid{grid-template-columns:repeat(2,1fr)} }
+@media (max-width:640px){ .in-grid{grid-template-columns:1fr} }
+.in-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px;min-width:0}
+.in-card h3{margin:0 0 4px;font-size:0.78rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--ink-faint);font-weight:700}
+.in-field{margin-top:12px}
+.in-field label{display:block;font-size:0.82rem;color:var(--ink);margin-bottom:5px;font-weight:500}
+.in-field input{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--ink);border-radius:7px;padding:8px 10px;font-size:0.9rem;font-family:inherit}
+.in-field input:focus{outline:2px solid var(--og-orange);outline-offset:1px}
+.in-hint{font-size:0.72rem;color:var(--ink-faint);margin-top:4px}
+.in-hint.unwired{color:var(--og-orange)}
+</style>
+
+<div class="topbar">
+  <h1 id="pageTitle">Registry - Hardware Sizing and Estimation</h1>
+</div>
+
+<div class="tabs">
+  <button class="tab-btn active" data-tab="t2">Implementation Partner Inputs</button>
+  <button class="tab-btn" data-tab="t1">Estimation and Sizing</button>
+</div>
+
+<div class="wrap">
+  <div class="tabpanel active" id="t2">
+    <div class="in-grid">
+      <div class="in-card">
+        <h3>Section 1 — Nomenclature</h3>
+        <div class="in-field">
+          <label for="inNamespace">Namespace for the Deployment</label>
+          <input type="text" id="inNamespace" value="perftest">
+        </div>
+        <div class="in-field">
+          <label for="inRegistryName">Name of the Registry</label>
+          <input type="text" id="inRegistryName" value="Farmer Registry">
+        </div>
+        <div class="in-hint">Drives every Kubernetes name and database name on the Architecture tab — nothing there is hardcoded to "farmer" any more.</div>
+        <div class="in-field">
+          <label for="inSizingYears">Number of years to be considered for Sizing</label>
+          <input type="number" id="inSizingYears" value="5" min="1" step="1">
+        </div>
+        <div class="in-hint">How many years of accumulated Change Request / Intake Submission storage growth to provision Postgres for up front — see the Postgres box on the Architecture tab.</div>
+      </div>
+
+      <div class="in-card">
+        <h3>Section 2 — Register Design</h3>
+        <div class="in-field">
+          <label for="inSecondaryRegisters">Number of Secondary Registers (1 Primary Register assumed)</label>
+          <input type="number" id="inSecondaryRegisters" value="1" min="0" step="1">
+        </div>
+        <div class="in-field">
+          <label for="inSupportingTables">Number of Supporting Tables</label>
+          <input type="number" id="inSupportingTables" value="14" min="0" step="1">
+        </div>
+        <div class="in-field">
+          <label for="inRatioSecondaryRecords">Records in one Secondary Register, per record in the Primary Register</label>
+          <input type="number" id="inRatioSecondaryRecords" value="0.41" min="0" step="0.1">
+        </div>
+        <div class="in-field">
+          <label for="inRatioTableRecords">Records in one Supporting Table, per record in the Primary Register</label>
+          <input type="number" id="inRatioTableRecords" value="1.33" min="0" step="0.01">
+        </div>
+        <div class="in-field">
+          <label for="inFilesPerRecord">Files / documents per record in the Primary Register</label>
+          <input type="number" id="inFilesPerRecord" value="4" min="0" step="1">
+        </div>
+        <div class="in-field">
+          <label for="inMaxFileSizeKB">Maximum File size per file in KB</label>
+          <input type="number" id="inMaxFileSizeKB" value="384" min="0" step="1">
+          <div class="in-hint">Used directly as the per-file size for the <code>commons-minio</code> object-storage estimate on the Architecture tab (NFS box) — a conservative stand-in for average file size.</div>
+        </div>
+        <div class="in-field">
+          <label for="inIntakeForms">Number of Intake Forms</label>
+          <input type="number" id="inIntakeForms" value="3" min="0" step="1">
+          <div class="in-hint unwired">Captured for reference — not yet wired into a calculation below.</div>
+        </div>
+        <div class="in-hint">The two ratios and the Secondary Register / Supporting Table counts above combine (count × ratio × Primary Register records, Section 3) to size the Postgres and NFS storage estimates on the Architecture tab. Grounded in the Farmer Registry measurements: Primary Register = <code>g2p_register_farmers</code> (10,150,268 rows), Secondary Register = <code>g2p_register_households</code> (4,150,063 rows, ratio 0.41), every other table = a Supporting Table — defaulted to the 14 tables that actually scale with farmer count (ratio 1.33 rows/table per farmer); the ~69 static config/lookup tables with near-zero rows regardless of registry size are excluded from this count.</div>
+      </div>
+
+      <div class="in-col">
+        <div class="in-card">
+          <h3>Section 3 — Registry Volume</h3>
+          <div class="in-field">
+            <label for="inPrimaryRecords">Number of Records in Primary Register</label>
+            <input type="text" inputmode="numeric" id="inPrimaryRecords" value="1,000,000">
+          </div>
+          <div class="in-hint">The base record count every Section 2 ratio multiplies against, and what the staff-api pod-count curve and Postgres storage estimate are interpolated by.</div>
+        </div>
+
+        <div class="in-card">
+          <h3>Section 4 — Transaction Volume (Staff)</h3>
+          <div class="in-field">
+            <label for="inConcurrentUsers">Number of Concurrent Staff Users</label>
+            <input type="number" id="inConcurrentUsers" value="20" min="0" step="1">
+          </div>
+          <div class="in-field">
+            <label for="inStaffTxnPerDay">Transactions per day from Staff UI (Change Requests, Intake Submissions)</label>
+            <input type="text" inputmode="numeric" id="inStaffTxnPerDay" value="500">
+          </div>
+          <div class="in-field">
+            <label for="inStaffSearchTxnPerDay">Search Transactions per day from Staff UI</label>
+            <input type="text" inputmode="numeric" id="inStaffSearchTxnPerDay" value="500">
+            <div class="in-hint">Sizes <code>loki-minio</code> on the Architecture tab, at a measured 855 bytes of log per search.</div>
+          </div>
+          <div class="in-hint">Concurrent users size staff-api pods; the daily transaction count (assumed even split between Change Requests and Intake Submissions) combines with Section 5's to size celery-worker pods, the farmer_registry database's accumulated growth, and part of loki-minio's log volume.</div>
+        </div>
+      </div>
+
+      <div class="in-col">
+        <div class="in-card">
+          <h3>Section 5 — Transaction Volume (Partner Systems)</h3>
+          <div class="in-field">
+            <label for="inNumPartners">Number of Partners interfacing with Partner-API</label>
+            <input type="number" id="inNumPartners" value="2" min="0" step="1">
+            <div class="in-hint unwired">Captured for reference — not yet wired into a calculation below.</div>
+          </div>
+          <div class="in-field">
+            <label for="inPartnerTxnPerDay">Transactions per day from Partners (Change Requests, Intake Submissions)</label>
+            <input type="text" inputmode="numeric" id="inPartnerTxnPerDay" value="1,000">
+            <div class="in-hint">Checked against partner-api's measured Ingest API capacity curve (RPS at pod 1/2/3) to help size its pod count on the Architecture tab.</div>
+          </div>
+          <div class="in-field">
+            <label for="inPartnerSearchTxnPerDay">Search Transactions per day from Partners</label>
+            <input type="text" inputmode="numeric" id="inPartnerSearchTxnPerDay" value="5,000">
+            <div class="in-hint">Sizes <code>loki-minio</code> on the Architecture tab, at a measured 2,175 bytes of log per sync search. Also checked against partner-api's measured DCI search capacity curve (sync RPS at pod 1/2/3, blended across the range query types) — whichever of this and Transactions/day above demands more pods wins.</div>
+          </div>
+          <div class="in-hint">Combines with Section 4's Staff UI transaction count to size celery-worker pods (register-write + intake-ingest pipelines), the farmer_registry database's accumulated growth, and part of loki-minio's log volume (partner-api is assumed to log the same as staff-api for CR creation/intake submission). Transactions/day and Search Transactions/day above also now size partner-api's own pod count directly, against its measured capacity curves.</div>
+        </div>
+
+        <div class="in-card">
+          <h3>Section 6 — Log Retention</h3>
+          <div class="in-field">
+            <label for="inLogRetention">Number of Days for Log File Retention</label>
+            <input type="number" id="inLogRetention" value="15" min="1" step="1">
+          </div>
+          <div class="in-hint">Multiplies the daily log volume (computed from real per-request/per-task log sizes, Sections 4-5) to size <code>loki-minio</code> on the Architecture tab.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="tabpanel" id="t1">
+    <div class="legend">
+      <span class="lgroup"><span class="lhead">Workload</span>column position — UI / API / Celery Beat / Celery Worker / 3rd-party</span>
+      <span class="lgroup">
+        <span class="lhead">Origin (fill)</span>
+        <span class="sw"><span class="dot" style="background:var(--openg2p-bg);border-color:var(--openg2p-border)"></span>OpenG2P-built</span>
+        <span class="sw"><span class="dot" style="background:var(--nonopeng2p-bg);border-color:var(--nonopeng2p-border)"></span>Non-OpenG2P (3rd party)</span>
+      </span>
+      <span class="lgroup">
+        <span class="lhead">QoS class (border)</span>
+        <span class="sw"><span class="dot" style="background:transparent;border-color:var(--qos-guaranteed-border)"></span>Guaranteed (request = limit)</span>
+        <span class="sw"><span class="dot" style="background:transparent;border-color:var(--qos-burstable-border)"></span>Burstable (request &lt; limit)</span>
+        <span class="sw"><span class="dot" style="background:transparent;border-color:var(--qtag-ba-border)"></span>Burstable + assumed, in API/Celery Beat/Celery Worker only — so it doesn't read as a 3rd-party pod</span>
+      </span>
+      <span class="lgroup">
+        <span class="lhead">Confidence (tag)</span>
+        <span class="tag" style="padding:1px 6px;background:var(--tag-measured-bg);color:var(--tag-measured-fg)">measured</span>
+        <span class="tag" style="padding:1px 6px;background:var(--tag-assumed-bg);color:var(--tag-assumed-fg)">assumed</span>
+      </span>
+      <span class="lgroup">
+        <span class="lhead">Persistence</span>
+        <span class="sw">uses Postgres / uses NFS / none — see each pod's popover, or the 3rd-party column headers</span>
+      </span>
+    </div>
+    <div class="canvas-shell">
+      <svg id="diagram" viewBox="0 0 1315 1470" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="var(--arrow)"></path>
+          </marker>
+        </defs>
+      </svg>
+    </div>
+    <div id="popOverlay" class="overlay"></div>
+    <div id="pop" class="pop" role="dialog" aria-live="polite"></div>
+  </div>
+</div>
+
+
+<script>
+(function(){
+"use strict";
+
+var NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs){
+  var e = document.createElementNS(NS, tag);
+  for (var k in attrs) e.setAttribute(k, attrs[k]);
+  return e;
+}
+
+function wrapName(name, maxLine){
+  maxLine = maxLine || 19;
+  if (name.length <= maxLine) return [name];
+  var mid = name.length/2, best = -1, bestDist = 1e9;
+  for (var i=0;i<name.length;i++){
+    if (name[i]==="-" || name[i]==="_"){
+      var dist = Math.abs(i-mid);
+      if (dist < bestDist){ bestDist = dist; best = i; }
+    }
+  }
+  if (best === -1) return [name];
+  return [name.slice(0,best+1), name.slice(best+1)];
+}
+
+var CAT_LABELS = {
+  registry:"This registry's own pod (OpenG2P)", commons:"Shared OpenG2P commons pod",
+  thirdparty:"3rd Party pod (Non-OpenG2P)", nodebox:"Node", pg:"Database", pgbouncer:"Connection pooler",
+  storage:"Storage", das:"Storage"
+};
+
+// ARROW_STYLE: every arrow in this diagram goes through these two helpers and
+// this one shared style constant -- nothing can drift out of sync.
+var ARROW_COLOR = "var(--arrow)", ARROW_WIDTH = 2.4;
+
+// --------------------------------------------------------- INPUTS / MODEL --
+var HEADROOM = 0.30; // fixed assumption -- no headroom input field on Tab 1
+var ASSUMED_BYTES_PER_TABLE_ROW = 200; // assumed
+var ASSUMED_DB_GB = { masterdata:8, awe:8, idgenerator:8, keycloak:3, partnermgr:8, connector:8 };
+
+// Real measurements: 10,000 intake submissions and 10,000 change requests seeded
+// against the farmer-registry performance-test database (Primary Register =
+// g2p_register_farmers, Secondary Register = g2p_register_households), DB growth
+// read via table+index size (pg_total_relation_size) before/after; log bytes read
+// from Loki for the same 10,000-request runs -- staff-api search/CR-creation/
+// intake-submission, partner-api sync search, and the celery intake-ingest task.
+// Every figure below is bytes for ONE unit (one request / one task / one CR / one
+// intake submission), not a rate.
+// logBytesPerStaffChangeRequestCreation and logBytesPerStaffIntakeSubmission were
+// only ever measured on the staff-api HTTP endpoints -- partner-api has no
+// equivalent measurement. Assumed equal to the staff-api figure (same framework,
+// same log lines, so a reasonable stand-in) rather than left unmeasured; applied to
+// staff+partner combined volume in deriveModel(), not staff-only.
+var MEASURED_UNIT_SIZES = {
+  dbGrowthBytesPerChangeRequest: 4980,       // stored row + payload + history, after approval (register itself is an update, not new storage)
+  dbGrowthBytesPerIntakeSubmission: 43078,   // intake tables + register tables + history tables, all three stages
+  logBytesPerStaffSearch: 855,               // POST /register-data/search_in_a_register
+  logBytesPerPartnerSearch: 2175,            // POST /dci/sync/search, sync mode
+  logBytesPerStaffChangeRequestCreation: 1347, // POST /change-requests/create_change_request + AWE workflow-started line -- assumed same for partner-api
+  logBytesPerStaffIntakeSubmission: 866,     // POST /intake-form-data/save_intake_form_submission -- assumed same for partner-api
+  logBytesPerCeleryIntakeSubmission: 9401    // the full intake_form_register_ingest_worker task's log lines
+};
+
+// Audit Manager sizing, rebuilt from the actual registry-platform AuditMiddleware
+// source (openg2p-registry-staff-api and -partner-api's audit_middleware.py), not
+// from request-body sizes -- the middleware NEVER reads the request or response body.
+// Each audited call's CloudEvent carries only actor (type/id/name/username/roles/ip/
+// session_id) + action + outcome + context (api path/module/http_status/request_id);
+// `details` JSONB in the real audit_events table (see openg2p-documentation/platform/
+// platform-services/audit-manager/technical-architecture.md) ends up holding that
+// actor/context, not a resource payload -- there IS no request-payload capture to
+// size for today. Reconstructing that exact CloudEvent shape for every endpoint below
+// gives a near-constant ~700-735 bytes regardless of which action it is, since nothing
+// about the business payload ever enters it -- so one representative constant is used
+// for all of them. Two real-code findings materially change the volume math too:
+//   1. staff-api's own ResolvePermissionMiddleware populates request.state.auth on
+//      every authenticated call, so staff-api audits every call, success or failure.
+//      partner-api has no equivalent -- its audit_middleware.py docstring says outright
+//      that until a controller sets request.state.audit_actor (grep confirms none do,
+//      in registry-platform as read), a successful partner-api call is NOT audited at
+//      all; only failures are, via the anonymous-failure policy. So partner-submitted
+//      CR/Intake/Search volume is excluded below -- it isn't in the audit DB today.
+//   2. One intake submission is NOT one audited call: intake_create's locustfile calls
+//      POST /intake-form-data/save_intake_form_submission once per section (10 sections
+//      in SECTION_DEFS) -- 10 audit rows per submission, not 1.
+// Still tagged "assumed", not "measured" -- grounded in the real middleware/locust
+// source, not an actual Audit Manager benchmark run (none exists yet).
+var AUDIT_EVENT_BYTES = 720; // CloudEvent per audited call -- actor+action+outcome+context, no payload
+var AUDIT_EVENTS_PER_INTAKE_SUBMISSION_CREATE = 10; // one save_intake_form_submission call per SECTION_DEFS section
+
+// Kubernetes system overhead on the Compute Node -- kubelet, containerd, kube-proxy,
+// CNI, CoreDNS, metrics-server, plus RKE2's own control-plane processes since this is
+// a single-node cluster (no separate control-plane node), with headroom left over for
+// Istio sidecars and observability agents on top. Assumed, not measured.
+var K8S_OVERHEAD_VCPU = 8, K8S_OVERHEAD_RAM_GB = 8;
+
+// Suggested Instance is built from only these three m5a sizes. Each is an exact
+// multiple of m5a.large (2xlarge = 4x large, 4xlarge = 8x large = 2x 2xlarge), and
+// each is exactly 4 GB RAM per vCPU, so: (1) covering whichever of (vCPU needed) or
+// (RAM needed / 4) is larger covers both dimensions at once, regardless of which one
+// actually binds for a given input; (2) converting that figure into "how many 2-vCPU
+// (m5a.large) units, minimum" and decomposing that count in base 4 -- as many 4xlarge
+// as fit, then 2xlarge, then large -- always finds the fewest possible instances.
+// A naive per-size floor/ceil pass can land on something like 4x m5a.large as the
+// final remainder, which has the exact same capacity as 1x m5a.2xlarge but is 3 more
+// nodes to run; this decomposition can't produce that, since a remainder of 4+ of the
+// smallest unit is always captured by the next size up before it gets that far.
+// Disk per instance is 8 GB per vCPU @ 3000 IOPS (the same ratio the real m5a.4xlarge
+// benchmark instance was sized at: 128 GB for 16 vCPU).
+var AWS_DISK_GB_PER_VCPU = 8, AWS_DISK_IOPS = 3000;
+function suggestInstanceCombo(vcpuNeeded, ramNeeded){
+  var effVcpu = Math.max(vcpuNeeded, ramNeeded/4); // vCPU-equivalent that covers both dimensions at once
+  var units = Math.ceil(effVcpu/2); // units of 2 vCPU -- one m5a.large each, minimum
+  var n4 = Math.floor(units/8); units -= n4*8;  // 1x m5a.4xlarge = 8 units
+  var n2 = Math.floor(units/4); units -= n2*4;  // 1x m5a.2xlarge = 4 units
+  var n1 = units;                                // 0-3 leftover m5a.large -- never 4+, by construction
+  var sizes = [["m5a.4xlarge",16,64,n4], ["m5a.2xlarge",8,32,n2], ["m5a.large",2,8,n1]];
+  var totalVcpu = 0, totalRam = 0, parts = [];
+  sizes.forEach(function(s){
+    var name=s[0], vcpu=s[1], ramGB=s[2], n=s[3];
+    if (n <= 0) return;
+    totalVcpu += n*vcpu; totalRam += n*ramGB;
+    var disk = vcpu*AWS_DISK_GB_PER_VCPU;
+    parts.push(n+"× "+name+" ("+vcpu+" vCPU / "+ramGB+" GB, "+disk+" GB gp3 @ "+AWS_DISK_IOPS+" IOPS each)");
+  });
+  if (parts.length === 0){ // effVcpu <= 0 shouldn't happen given the overhead floor, but stay safe
+    parts.push("1× m5a.large (2 vCPU / 8 GB, 16 GB gp3 @ "+AWS_DISK_IOPS+" IOPS each)");
+    totalVcpu = 2; totalRam = 8;
+  }
+  return {parts: parts, label: parts.join(" + "), totalVcpu: totalVcpu, totalRam: totalRam};
+}
+
+// Measured capacity curves, ported from the staff-api / celery benchmark reports.
+var STAFF_TIERS = [10150268, 50000264];
+var STAFF_CAPS  = [[184,319,453],[164,329,369]]; // real concurrent users at pod 1/2/3, e2e ingress
+// Celery combined curve = "register write (new)" + "register ingest" pipelines (rows/min, pod 1/2/3) --
+// a simplified stand-in for the 15-pipeline blended benchmark, since Tab 1 only collects two aggregate
+// transaction-volume numbers rather than a per-pipeline breakdown. Tagged "assumed" in the popover for
+// that reason even though the underlying rates are real measured numbers.
+var CELERY_COMBINED_RATES = [2284, 4116, 5425];
+var STORAGE_POINTS = [[10150268,139.3],[50000264,715.1]]; // farmer-registry rows -> total Postgres GB
+
+// Partner-api benchmark (see partner-api/final-report-summary.md): 2 vCPU limit,
+// requests==limits, matches SHAPE_CORE_GUARANTEED already assigned below. Two curves,
+// since Tab 1 collects search volume and ingest volume as separate daily counters:
+// PARTNER_SEARCH_RATES is the sync RPS averaged across the three range query types
+// (expression/graphql/predicate) at pod 1/2/3 -- Single Farmer Search using ID is
+// excluded as an outlier (10-30x higher RPS, a trivial single-record lookup, not
+// representative of a typical DCI range search), and sync is used rather than async
+// because the report states async's bottleneck is the downstream Kafka/WebSub publish
+// path, not the partner pod itself, so sync is what actually stresses this pod's
+// capacity. PARTNER_INGEST_RATES is the raw Ingest API RPS (one curve, no blending
+// needed). Tagged "assumed" in the popover for the range-type blend, same as
+// CELERY_COMBINED_RATES, even though every underlying number is measured.
+var PARTNER_SEARCH_RATES = [3.33, 5.36, 5.10];
+var PARTNER_INGEST_RATES = [85.74, 141.13, 187.91];
+
+function clamp(v,lo,hi){ return Math.max(lo,Math.min(hi,v)); }
+function num(id, dflt, lo, hi){
+  var e = document.getElementById(id);
+  var v = e ? parseFloat(e.value.replace(/,/g,"")) : NaN; // strip 1000s separators before parsing
+  if (isNaN(v)) v = dflt;
+  return clamp(v, lo===undefined?0:lo, hi===undefined?1e12:hi);
+}
+// Big-value fields are plain text inputs (not type=number) so they can show
+// 1000s separators -- this reformats them live as the user types.
+var BIG_NUMBER_IDS = ["inPrimaryRecords","inStaffTxnPerDay","inStaffSearchTxnPerDay","inPartnerTxnPerDay","inPartnerSearchTxnPerDay"];
+function formatBigNumberInput(e){
+  var el = e.target;
+  var digits = el.value.replace(/[^0-9]/g,"");
+  el.value = digits ? Number(digits).toLocaleString("en-US") : "";
+}
+function txt(id, dflt){
+  var e = document.getElementById(id);
+  var v = e ? e.value.trim() : "";
+  return v || dflt;
+}
+function lerp(x0,y0,x1,y1,x){ if(x1===x0) return y0; return y0 + (y1-y0)*(x-x0)/(x1-x0); }
+function interpArr(a0,x0,a1,x1,x){ return a0.map(function(v,i){ return lerp(x0,v,x1,a1[i],x); }); }
+// Smallest pod count (>=1) whose capacity meets `need`; extrapolates past pod-3
+// using the pod2->pod3 marginal gain, only if positive, capped at 12.
+function podsNeeded(caps, need){
+  for (var n=1;n<=3;n++){ if (caps[n-1] >= need) return n; }
+  var marginal = caps[2]-caps[1];
+  if (marginal <= 0) return 3;
+  var n=3, cap=caps[2];
+  while (cap < need && n < 12){ n++; cap+=marginal; }
+  return n;
+}
+function slugify(s){ return (s||"").toLowerCase().trim().replace(/[^a-z0-9]+/g,"-").replace(/^-+|-+$/g,"") || "registry"; }
+function snakify(s){ return slugify(s).replace(/-/g,"_"); }
+function fmtGB(gb){ if (gb>=1024) return (gb/1024).toFixed(2)+" TB"; return gb.toFixed(1)+" GB"; }
+
+var INPUTS = {}, MODEL = {}, REG_SLUG = "farmer-registry", REG_SNAKE = "farmer_registry", NAMESPACE = "perftest";
+
+function tplName(s){ return s.replace(/\{reg\}/g, REG_SLUG).replace(/\{regsnake\}/g, REG_SNAKE); }
+function tplNs(s){ return s ? s.replace("{ns}", NAMESPACE) : s; }
+
+function readInputs(){
+  INPUTS.namespace = txt("inNamespace","perftest");
+  INPUTS.registryName = txt("inRegistryName","Farmer Registry");
+  INPUTS.primaryRecords = num("inPrimaryRecords", 1000000);
+  INPUTS.secondaryRegisters = num("inSecondaryRegisters", 1);
+  INPUTS.supportingTables = num("inSupportingTables", 14);
+  INPUTS.intakeForms = num("inIntakeForms", 3);
+  INPUTS.ratioSecondaryRecords = num("inRatioSecondaryRecords", 0.41);
+  INPUTS.ratioTableRecords = num("inRatioTableRecords", 1.33);
+  INPUTS.maxFileSizeKB = num("inMaxFileSizeKB", 384);
+  INPUTS.filesPerRecord = num("inFilesPerRecord", 4);
+  INPUTS.concurrentUsers = num("inConcurrentUsers", 20);
+  INPUTS.staffTxnPerDay = num("inStaffTxnPerDay", 500);
+  INPUTS.staffSearchTxnPerDay = num("inStaffSearchTxnPerDay", 500);
+  INPUTS.numPartners = num("inNumPartners", 2);
+  INPUTS.partnerTxnPerDay = num("inPartnerTxnPerDay", 1000);
+  INPUTS.partnerSearchTxnPerDay = num("inPartnerSearchTxnPerDay", 5000);
+  INPUTS.logRetention = num("inLogRetention", 15, 1);
+  INPUTS.sizingYears = num("inSizingYears", 5, 1);
+
+  NAMESPACE = INPUTS.namespace;
+  REG_SLUG = slugify(INPUTS.registryName);
+  REG_SNAKE = snakify(INPUTS.registryName);
+}
+
+function deriveModel(){
+  // Secondary Register / Supporting Table totals are each: count of registers (or
+  // tables) x the per-Primary-Register-record ratio x Primary Register records
+  // (Section 2 x Section 3) -- both ratios are now load-bearing inputs, not just
+  // informational cross-checks.
+  var totalSecondaryRecords = INPUTS.secondaryRegisters * INPUTS.ratioSecondaryRecords * INPUTS.primaryRecords;
+  var totalRegisterRecords = INPUTS.primaryRecords + totalSecondaryRecords;
+  var totalTableRecords = INPUTS.supportingTables * INPUTS.ratioTableRecords * INPUTS.primaryRecords;
+  var totalDocuments = INPUTS.primaryRecords * INPUTS.filesPerRecord;
+  var totalDailyTxns = INPUTS.staffTxnPerDay + INPUTS.partnerTxnPerDay;
+
+  // Tab 1's "Transactions per day" (Staff UI + Partners) is Change Requests and
+  // Intake Submissions combined, with no split between the two -- assumed even
+  // 50/50 here, since the two have very different per-unit DB/log footprints (an
+  // intake submission writes ~8.6x the DB bytes a change request does) and no input
+  // distinguishes them. Both the DB growth and the log-size terms below use
+  // staff+partner combined: DB growth because a row's size on disk doesn't depend
+  // on which API wrote it, and the CR-creation/intake-submission log sizes because
+  // partner-api is assumed to log the same amount as staff-api for the same
+  // operation (see MEASURED_UNIT_SIZES -- there's no partner-api measurement for
+  // either, only for search).
+  var totalCrPerDay = totalDailyTxns / 2, totalIntakePerDay = totalDailyTxns / 2;
+
+  var staffCaps = interpArr(STAFF_CAPS[0], STAFF_TIERS[0], STAFF_CAPS[1], STAFF_TIERS[1], totalRegisterRecords);
+  var staffNeed = INPUTS.concurrentUsers / (1 - HEADROOM);
+  var staffApiPods = podsNeeded(staffCaps, staffNeed);
+
+  var celeryNeedRate = (totalDailyTxns / 1440) / (1 - HEADROOM);
+  var celeryWorkerPods = podsNeeded(CELERY_COMBINED_RATES, celeryNeedRate);
+
+  // partner-api pods must cover whichever of its two measured endpoint types demands
+  // more capacity -- search (much lower RPS ceiling per pod) and ingest (much higher) --
+  // taking the max rather than summing, since no combined-load benchmark exists and
+  // each curve was measured against that endpoint type in isolation.
+  var partnerSearchNeedRate = (INPUTS.partnerSearchTxnPerDay / 86400) / (1 - HEADROOM);
+  var partnerIngestNeedRate = (INPUTS.partnerTxnPerDay / 86400) / (1 - HEADROOM);
+  var partnerApiPods = Math.max(
+    podsNeeded(PARTNER_SEARCH_RATES, partnerSearchNeedRate),
+    podsNeeded(PARTNER_INGEST_RATES, partnerIngestNeedRate)
+  );
+
+  var mainDbGB = lerp(STORAGE_POINTS[0][0], STORAGE_POINTS[0][1], STORAGE_POINTS[1][0], STORAGE_POINTS[1][1], totalRegisterRecords);
+  var storageExtrapolated = totalRegisterRecords < STORAGE_POINTS[0][0] || totalRegisterRecords > STORAGE_POINTS[1][0];
+  var tableStorageGB = (totalTableRecords * ASSUMED_BYTES_PER_TABLE_ROW) / 1e9;
+
+  // Change Requests and Intake Submissions accumulate in Postgres permanently (unlike
+  // logs, which roll off after the retention window), so this is sized for the full
+  // Tab 1 "years to be considered" horizon, not just today's snapshot. Staff +
+  // partner combined -- see note above.
+  var dailyTxnDbGrowthBytes = totalCrPerDay * MEASURED_UNIT_SIZES.dbGrowthBytesPerChangeRequest
+    + totalIntakePerDay * MEASURED_UNIT_SIZES.dbGrowthBytesPerIntakeSubmission;
+  var txnDbGrowthGB = (dailyTxnDbGrowthBytes * 365 * INPUTS.sizingYears) / 1e9;
+
+  // Daily Loki volume, built from the same five measured per-request/per-task log
+  // sizes -- replaces the old flat assumption entirely. This is a rolling window
+  // (retention days), not multiplied by the sizing-years horizon the way DB growth is.
+  // Search is the one pair actually measured separately per API (staff vs. partner);
+  // CR-creation/intake-submission/celery-ingest all use the combined total -- see the
+  // note above on why.
+  var dailyLogBytes = INPUTS.staffSearchTxnPerDay * MEASURED_UNIT_SIZES.logBytesPerStaffSearch
+    + INPUTS.partnerSearchTxnPerDay * MEASURED_UNIT_SIZES.logBytesPerPartnerSearch
+    + totalCrPerDay * MEASURED_UNIT_SIZES.logBytesPerStaffChangeRequestCreation
+    + totalIntakePerDay * MEASURED_UNIT_SIZES.logBytesPerStaffIntakeSubmission
+    + totalIntakePerDay * MEASURED_UNIT_SIZES.logBytesPerCeleryIntakeSubmission;
+  var dailyLogGB = dailyLogBytes / 1e9;
+  var lokiGB = dailyLogGB * INPUTS.logRetention;
+  var commonsMinioGB = (totalDocuments * (INPUTS.maxFileSizeKB / 1024)) / 1024; // KB -> MB -> GB
+  var kafkaGB = 2;
+
+  // Audit Manager's audit_events table accumulates permanently too (7-year default
+  // retention per its own technical-architecture.md), so like the Change Request /
+  // Intake Submission growth above, this is sized for the full Tab 1 "years to be
+  // considered" horizon, not a rolling window. Unlike that DB-growth/log-size model,
+  // this one is staff-API-only -- see AUDIT_EVENT_BYTES above for why partner-api
+  // volume (inPartnerTxnPerDay, inPartnerSearchTxnPerDay) isn't counted: it isn't
+  // actually in the audit DB under the real middleware today. Intake Submission create
+  // is 10 audited calls, not 1 -- see AUDIT_EVENTS_PER_INTAKE_SUBMISSION_CREATE.
+  var staffCrPerDay = INPUTS.staffTxnPerDay / 2, staffIntakePerDay = INPUTS.staffTxnPerDay / 2;
+  var dailyAuditEvents =
+      staffCrPerDay * 2 // create_change_request + submit_task_decision (approve)
+    + staffIntakePerDay * (AUDIT_EVENTS_PER_INTAKE_SUBMISSION_CREATE + 1) // 10 section saves + submit_task_decision (approve)
+    + INPUTS.staffSearchTxnPerDay; // search_in_a_register
+  var auditMgrGB = (dailyAuditEvents * AUDIT_EVENT_BYTES * 365 * INPUTS.sizingYears) / 1e9;
+
+  MODEL = {
+    totalRegisterRecords: totalRegisterRecords, totalTableRecords: totalTableRecords, totalDocuments: totalDocuments,
+    totalDailyTxns: totalDailyTxns, totalCrPerDay: totalCrPerDay, totalIntakePerDay: totalIntakePerDay,
+    staffApiPods: staffApiPods, staffNeed: staffNeed, staffCapAtPods: staffCaps[Math.min(staffApiPods,3)-1],
+    celeryWorkerPods: celeryWorkerPods, celeryNeedRate: celeryNeedRate,
+    partnerApiPods: partnerApiPods, partnerSearchNeedRate: partnerSearchNeedRate, partnerIngestNeedRate: partnerIngestNeedRate,
+    mainDbGB: mainDbGB, storageExtrapolated: storageExtrapolated, tableStorageGB: tableStorageGB,
+    txnDbGrowthGB: txnDbGrowthGB, dailyLogGB: dailyLogGB,
+    lokiGB: lokiGB, commonsMinioGB: commonsMinioGB, kafkaGB: kafkaGB, auditMgrGB: auditMgrGB
+  };
+}
+
+// --------------------------------------------------------------- MODEL ----
+var W = 150, H = 52;
+var NODE_X = 40, NODE_W = 1235;
+
+var NODES = [
+  {id:"revproxy", name:"Reverse Proxy Node", cat:"nodebox", kind:"node", x:NODE_X, y:20, w:NODE_W, h:120,
+   pop:{title:"Reverse Proxy Node", cat:"Ingress · single EC2 instance", rows:[
+      ["Instance","m5a.large"],["vCPU","2"],["RAM","8 GB"],["Disk","64 GB gp3 @ 3000 IOPS"]
+    ], tag:"measured", note:"The only internet-facing hop — can itself bottleneck end-to-end throughput at this instance size."}},
+
+  {id:"computenode", name:"Compute Node", cat:"nodebox", kind:"node", x:NODE_X, y:195, w:NODE_W, h:710,
+   pop:{title:"Compute Node", cat:"Kubernetes · one or more EC2 instances (RKE2)", rows:[
+      ["Runs","every pod below — all app, OpenG2P and third-party workloads"]
+    ], tag:"measured", note:""}},
+
+  {id:"storagenode", name:"Storage Node", cat:"nodebox", kind:"node", x:NODE_X, y:935, w:NODE_W, h:510,
+   pop:{title:"Storage Node", cat:"Database + NFS · single EC2 instance", rows:[
+      ["Instance","m5a.2xlarge (fixed)"],["vCPU","8"],["RAM","32 GB"],
+      ["Disk","see Direct-Attached Storage and NFS Storage below — both computed from Tab 1 inputs"],
+      ["Runs","host PostgreSQL 16 (not a K8s pod) + the NFS server backing NFS storage"]
+    ], tag:"measured", note:""}}
+];
+
+var RP_SUB = [
+  {id:"wireguard", name:"WireGuard", cat:"nodebox", x:NODE_X+280, y:65, w:280, h:56,
+   pop:{title:"WireGuard", cat:"VPN endpoint (process on the Reverse Proxy Node)", rows:[["Role","Encrypted tunnel into the cluster network"]],
+     tag:"measured", note:"Not a Kubernetes pod — a process on the Reverse Proxy EC2 instance."}},
+  {id:"nginx", name:"Nginx", cat:"nodebox", x:NODE_X+640, y:65, w:280, h:56,
+   pop:{title:"Nginx", cat:"Admin reverse proxy + TLS termination (process on the Reverse Proxy Node)", rows:[["Role","Public ingress, TLS termination"]],
+     tag:"measured", note:"Not a Kubernetes pod — a process on the Reverse Proxy EC2 instance."}}
+];
+
+// 7 pod columns, W=150 wide. UI->API gets a wider 50px gap (room for the
+// horizontal UI->API arrows below); the remaining gaps are the usual 15px.
+// Inside the Compute Node's 30px margins: 40+30=70 .. 40+1235-30=1245.
+var COL_X = {ui:70, api:270, celeryBeat:435, celeryWorker:600, thirdpartyPg:765, thirdpartyNfs:930, thirdpartyNoPersist:1095};
+var COL_Y0 = 278;
+
+// builtBy: "registry" (this registry's own code) | "commons" (shared OpenG2P commons) | "thirdparty".
+// origin (fill) is derived from builtBy: thirdparty -> nonopeng2p, else -> openg2p.
+// persist (border) is derived from column: thirdpartyNfs -> nfs, else from DB_TOUCHING membership -> pg, else none.
+// Standard resource shapes, reused across the PODS array below so every pod's
+// numbers trace back to one of these three named shapes (or the one labeled
+// Kafka exception) rather than being retyped per pod.
+var SHAPE_UI_GUARANTEED   = {request:{vcpu:1,ramGB:1}, limit:{vcpu:1,ramGB:1}};   // request==limit: QoS Guaranteed
+var SHAPE_CORE_GUARANTEED = {request:{vcpu:2,ramGB:2}, limit:{vcpu:2,ramGB:2}};   // request==limit: QoS Guaranteed
+var SHAPE_BURSTABLE       = {request:{vcpu:1,ramGB:1}, limit:{vcpu:2,ramGB:4}};   // request<limit: QoS Burstable
+var SHAPE_KAFKA_BURSTABLE = {request:{vcpu:1,ramGB:4}, limit:{vcpu:2,ramGB:6}};   // Burstable, higher RAM floor/ceiling
+
+var PODS = [
+  // ============ UI -- all Guaranteed, standard 1 vCPU / 1 GB, 1 pod each ============
+  {id:"staffui", name:"{reg}-staff-ui", ns:"{ns}", kind:"Deployment", builtBy:"registry", col:"ui", row:1,
+   request:SHAPE_UI_GUARANTEED.request, limit:SHAPE_UI_GUARANTEED.limit, qos:"guaranteed", sizing:{kind:"fixed",n:1}, tag:"assumed",
+   note:"Static/SSR frontend calling staff-api. Fixed at 1 pod — all UI pods use the standard 1 vCPU / 1 GB guaranteed shape regardless of load."},
+  {id:"masterdataui", name:"master-data-staff-ui", kind:"Deployment", builtBy:"commons", col:"ui", row:3,
+   request:SHAPE_UI_GUARANTEED.request, limit:SHAPE_UI_GUARANTEED.limit, qos:"guaranteed", sizing:{kind:"fixed",n:1}, tag:"assumed",
+   note:"Not deployed on this cluster — name shown here is a placeholder. Fixed at 1 pod, standard UI shape."},
+  {id:"pmui", name:"partner-management-staff-ui", ns:"{ns}", kind:"Deployment", builtBy:"commons", col:"ui", row:4,
+   request:SHAPE_UI_GUARANTEED.request, limit:SHAPE_UI_GUARANTEED.limit, qos:"guaranteed", sizing:{kind:"fixed",n:1}, tag:"assumed",
+   note:"Partner Management's staff-facing UI. Fixed at 1 pod, standard UI shape."},
+  {id:"iamui", name:"iam-staff-ui", kind:"Deployment", builtBy:"commons", col:"ui", row:5,
+   request:SHAPE_UI_GUARANTEED.request, limit:SHAPE_UI_GUARANTEED.limit, qos:"guaranteed", sizing:{kind:"fixed",n:1}, tag:"assumed",
+   note:"Not deployed on this cluster — name shown here is a placeholder. Fixed at 1 pod, standard UI shape."},
+  {id:"aweui", name:"awe-staff-ui", ns:"{ns}", kind:"Deployment", builtBy:"commons", col:"ui", row:2,
+   request:SHAPE_UI_GUARANTEED.request, limit:SHAPE_UI_GUARANTEED.limit, qos:"guaranteed", sizing:{kind:"fixed",n:1}, tag:"assumed",
+   note:"Approval Workflow Engine's UI. Fixed at 1 pod, standard UI shape."},
+  {id:"connectorui", name:"registry-connector-ui", kind:"Deployment", builtBy:"commons", col:"ui", row:6,
+   request:SHAPE_UI_GUARANTEED.request, limit:SHAPE_UI_GUARANTEED.limit, qos:"guaranteed", sizing:{kind:"fixed",n:1}, tag:"assumed",
+   note:"Admin UI for connector pipelines, runs, and the dead-letter queue. Disabled by default in the chart and not deployed on this cluster."},
+  {id:"staffportalui", name:"openg2p-staff-ui", ns:"{ns}", kind:"Deployment", builtBy:"commons", col:"ui", row:0, highlight:"landing",
+   request:SHAPE_UI_GUARANTEED.request, limit:SHAPE_UI_GUARANTEED.limit, qos:"guaranteed", sizing:{kind:"fixed",n:1}, tag:"assumed",
+   note:"The common landing page for staff users across every service, topmost in this column and colored separately from the rest. It links out to every other staff UI rather than calling one API of its own — no connecting arrow."},
+
+  // ============ API -- staffapi/partnerapi are Guaranteed (2 vCPU / 2 GB, request==limit);
+  // every other API pod is Burstable (1-2 vCPU, 1-4 GB). Row order is pinned to match each
+  // paired UI pod's row (see UI_API_PAIRS) so every UI->API arrow is a single straight
+  // horizontal line; staffapi/awe/masterdata/partnermgr/iam/connectorapi sit at rows
+  // 1/2/3/4/5/6 for exactly that reason, not in their original order. The three API pods
+  // with no UI counterpart (partnerapi, idgen, auditmgr) fill the remaining rows 0/7/8. ============
+  {id:"staffapi", name:"{reg}-staff-api", ns:"{ns}", kind:"Deployment", builtBy:"registry", col:"api", row:1,
+   request:SHAPE_CORE_GUARANTEED.request, limit:SHAPE_CORE_GUARANTEED.limit, qos:"guaranteed", sizing:{kind:"staffApi"}, tag:"measured",
+   note:"Pod count derived from Concurrent Staff Users (Tab 1), interpolated against the measured capacity curve at your total register-record count. See staff-api/final-report-summary.md."},
+  {id:"partnerapi", name:"{reg}-partner-api", ns:"{ns}", kind:"Deployment", builtBy:"registry", col:"api", row:0,
+   request:SHAPE_CORE_GUARANTEED.request, limit:SHAPE_CORE_GUARANTEED.limit, qos:"guaranteed", sizing:{kind:"partnerApi"}, tag:"measured",
+   note:"Pod count derived from Search Transactions/day and Partner Transactions/day (Tab 1), each checked against its own measured capacity curve (DCI search vs. ingest), taking whichever demands more pods. 2 vCPU / 2 GB guaranteed shape matches the benchmark's real pod spec (2 vCPU limit, requests==limits). See partner-api/final-report-summary.md."},
+  {id:"idgen", name:"id-generator-api", ns:"{ns}", kind:"Deployment", builtBy:"registry", col:"api", row:7,
+   request:SHAPE_BURSTABLE.request, limit:SHAPE_BURSTABLE.limit, qos:"burstable", sizing:{kind:"fixed",n:1}, tag:"assumed",
+   note:"Not yet benchmarked — fixed at 1 pod, standard burstable shape (1-2 vCPU, 1-4 GB)."},
+  {id:"awe", name:"awe-staff-api", ns:"{ns}", kind:"Deployment", builtBy:"commons", col:"api", row:2,
+   request:SHAPE_BURSTABLE.request, limit:SHAPE_BURSTABLE.limit, qos:"burstable", sizing:{kind:"sharedFixed",n:1}, tag:"measured",
+   note:"Shared across every registry in the environment — fixed at 1 pod regardless of this registry's load; don't multiply by registry count."},
+  {id:"auditmgr", name:"audit-manager-api", ns:"{ns}", kind:"Deployment", builtBy:"commons", col:"api", row:8,
+   request:SHAPE_BURSTABLE.request, limit:SHAPE_BURSTABLE.limit, qos:"burstable", sizing:{kind:"sharedFixed",n:1}, tag:"assumed",
+   note:"Not yet benchmarked — fixed at 1 pod (shared). Logs every API call, non-blocking."},
+  {id:"masterdata", name:"master-data-api", ns:"{ns}", kind:"Deployment", builtBy:"commons", col:"api", row:3,
+   request:SHAPE_BURSTABLE.request, limit:SHAPE_BURSTABLE.limit, qos:"burstable", sizing:{kind:"sharedFixed",n:1}, tag:"assumed",
+   note:"Not yet benchmarked — fixed at 1 pod (shared), standard burstable shape."},
+  {id:"partnermgr", name:"partner-management-api", ns:"{ns}", kind:"Deployment", builtBy:"commons", col:"api", row:4,
+   request:SHAPE_BURSTABLE.request, limit:SHAPE_BURSTABLE.limit, qos:"burstable", sizing:{kind:"sharedFixed",n:1}, tag:"assumed",
+   note:"Serves partner keys to the “partner-mgmt” crypto backend used for DCI signature verification; also partner-management-staff-ui's backend. Fixed at 1 pod (shared)."},
+  {id:"iam", name:"iam-staff-api", ns:"{ns}", kind:"Deployment", builtBy:"commons", col:"api", row:5,
+   request:SHAPE_BURSTABLE.request, limit:SHAPE_BURSTABLE.limit, qos:"burstable", sizing:{kind:"sharedFixed",n:1}, tag:"assumed",
+   note:"Registers this registry's clients/roles into Keycloak. No database of its own. Fixed at 1 pod (shared)."},
+  {id:"connectorapi", name:"registry-connector-api", kind:"Deployment", builtBy:"commons", col:"api", row:6,
+   request:SHAPE_BURSTABLE.request, limit:SHAPE_BURSTABLE.limit, qos:"burstable", sizing:{kind:"fixed",n:1}, tag:"assumed",
+   note:"Fetches and publishes data between external systems and the registry. Not yet deployed on this cluster — fixed at 1 pod, standard burstable shape."},
+
+  // ============ Celery Beat -- farmer-registry-celery-beat is Guaranteed, always exactly
+  // 1 pod (never scaled, to avoid duplicate scheduling); registry-connector-beat is
+  // Burstable, also always 1 pod. ============
+  {id:"celerybeat", name:"{reg}-celery-beat", ns:"{ns}", kind:"Deployment", builtBy:"registry", col:"celeryBeat", row:0,
+   request:SHAPE_CORE_GUARANTEED.request, limit:SHAPE_CORE_GUARANTEED.limit, qos:"guaranteed", sizing:{kind:"fixed",n:1}, tag:"measured",
+   note:"Combined worker+beat process (--concurrency=2). Beat pods are always exactly 1 — never scaled, to avoid duplicate scheduling. Measured at 2 vCPU / 4 GB in the celery benchmark; standardized to the guaranteed-tier shape (2 vCPU / 2 GB) here."},
+  {id:"connectorbeat", name:"registry-connector-beat", kind:"Deployment", builtBy:"commons", col:"celeryBeat", row:1,
+   request:SHAPE_BURSTABLE.request, limit:SHAPE_BURSTABLE.limit, qos:"burstable", sizing:{kind:"fixed",n:1}, tag:"assumed",
+   note:"Schedules the connector's recurring pipeline runs. Not yet deployed on this cluster — fixed at 1 pod, standard burstable shape."},
+
+  // ============ Celery Worker -- farmer-registry-celery-worker is Guaranteed with a
+  // derived count; registry-connector-worker is Burstable, fixed at 1 pod. ============
+  {id:"celeryworker", name:"{reg}-celery-worker", ns:"{ns}", kind:"Deployment", builtBy:"registry", col:"celeryWorker", row:0,
+   request:SHAPE_CORE_GUARANTEED.request, limit:SHAPE_CORE_GUARANTEED.limit, qos:"guaranteed", sizing:{kind:"celeryWorker"}, tag:"measured",
+   note:"Pod count derived from the combined Staff UI + Partner daily transaction volume (Tab 1) against the register-write + intake-ingest pipeline curves. Measured at 2 vCPU / 4 GB in the celery benchmark; standardized to the guaranteed-tier shape (2 vCPU / 2 GB) here. See celery/final-report-summary.md."},
+  {id:"connectorworker", name:"registry-connector-worker", kind:"Deployment", builtBy:"commons", col:"celeryWorker", row:1,
+   request:SHAPE_BURSTABLE.request, limit:SHAPE_BURSTABLE.limit, qos:"burstable", sizing:{kind:"fixed",n:1}, tag:"assumed",
+   note:"Runs the connector's pipeline/sync jobs. Not yet deployed on this cluster — fixed at 1 pod, standard burstable shape."},
+
+  // ============ 3rd Party, split by what each one connects to -- all Burstable, as are
+  // the two full columns (uses-NFS / no-persistence) below. ============
+  {id:"keycloak", name:"keycloak", ns:"{ns}", kind:"StatefulSet", builtBy:"thirdparty", col:"thirdpartyPg", row:0,
+   request:SHAPE_BURSTABLE.request, limit:SHAPE_BURSTABLE.limit, qos:"burstable", sizing:{kind:"fixed",n:1}, tag:"measured",
+   note:"Shared across every registry — fixed count, don't multiply by registry count."},
+
+  {id:"lokiminio", name:"loki-minio", ns:"observability", kind:"Deployment", builtBy:"thirdparty", col:"thirdpartyNfs", row:0,
+   request:SHAPE_BURSTABLE.request, limit:SHAPE_BURSTABLE.limit, qos:"burstable", sizing:{kind:"fixed",n:1}, tag:"measured",
+   note:"Dedicated MinIO for Loki's own log chunks, separate instance from commons-minio."},
+  {id:"commonsminio", name:"commons-minio", ns:"{ns}", kind:"Deployment", builtBy:"thirdparty", col:"thirdpartyNfs", row:1,
+   request:SHAPE_BURSTABLE.request, limit:SHAPE_BURSTABLE.limit, qos:"burstable", sizing:{kind:"fixed",n:1}, tag:"assumed",
+   note:"Application object store (profile images, document templates, uploaded files), separate instance from loki-minio."},
+  {id:"kafka", name:"commons-kafka-controller", ns:"{ns}", kind:"StatefulSet", builtBy:"thirdparty", col:"thirdpartyNfs", row:2,
+   request:SHAPE_KAFKA_BURSTABLE.request, limit:SHAPE_KAFKA_BURSTABLE.limit, qos:"burstable", sizing:{kind:"fixed",n:1}, tag:"assumed",
+   note:"WebSub's internal message broker (single broker, non-HA). Higher RAM floor/ceiling than the other burstable pods here (4-6 GB, not 1-4 GB) — a JVM broker needs more headroom."},
+
+  {id:"websub", name:"websub", ns:"{ns}", kind:"Deployment", builtBy:"thirdparty", col:"thirdpartyNoPersist", row:0,
+   request:SHAPE_BURSTABLE.request, limit:SHAPE_BURSTABLE.limit, qos:"burstable", sizing:{kind:"fixed",n:2}, tag:"assumed",
+   note:"MOSIP WebSub hub — publishes outgest/async-search callbacks. Stateless; backed by Kafka, no database or volume of its own."},
+  {id:"redis", name:"{reg}-redis-master", ns:"{ns}", kind:"StatefulSet", builtBy:"thirdparty", col:"thirdpartyNoPersist", row:1,
+   request:SHAPE_BURSTABLE.request, limit:SHAPE_BURSTABLE.limit, qos:"burstable", sizing:{kind:"fixed",n:1}, tag:"assumed",
+   note:"Celery broker and result backend — in-memory, no persistent storage. Two sibling Redis instances serve other commons-services and are out of scope here."}
+];
+
+// Pods that connect into Postgres through PgBouncer -- drives both the merge-feeder
+// arrows and each pod's border color (persist="pg").
+var DB_TOUCHING = ["staffapi","partnerapi","idgen","awe","auditmgr","masterdata","partnermgr","iam","connectorapi",
+  "celerybeat","celeryworker","connectorworker","connectorbeat","keycloak"];
+
+// UI pods that have a matching API pod, connected by one arrow each. The API
+// column's row order (below) is deliberately chosen to match the UI column's --
+// every pair below lines up row-for-row, so every one of these arrows renders as
+// a single straight horizontal line; the renderer still falls back to a 3-segment
+// orthogonal elbow (never diagonal) if a future edit ever lets a pair's rows drift
+// apart again. staffportalui has no entry here and gets no arrow -- it links out
+// to every other staff UI rather than calling one API of its own.
+var UI_API_PAIRS = [["staffui","staffapi"], ["aweui","awe"], ["masterdataui","masterdata"],
+  ["pmui","partnermgr"], ["iamui","iam"], ["connectorui","connectorapi"]];
+
+function originOf(p){ return p.builtBy==="thirdparty" ? "nonopeng2p" : "openg2p"; }
+// Persistence is fully determined by column already (every pod in a given column
+// shares the same answer -- that's what the column headers themselves say), so it's
+// surfaced as a popover row rather than a second border-color channel; the border
+// itself encodes QoS class instead (see qosOf()).
+function persistOf(p){
+  if (p.col === "thirdpartyNfs") return "nfs";
+  if (DB_TOUCHING.indexOf(p.id) >= 0) return "pg";
+  return "none";
+}
+function persistLabel(persist){
+  return persist === "pg" ? "Postgres (via PgBouncer)" : persist === "nfs" ? "NFS" : "None";
+}
+function qosOf(p){ return p.qos; }
+
+// ---- Storage Node contents ----
+// PgBouncer's x/w is chosen to sit roughly under the middle of the 4 Postgres-feeding
+// columns (API, Celery Beat, Celery Worker, 3rd-party-Postgres) for a short, tidy bus
+// line -- but the vertical-line correctness of the merge arrow does NOT depend on this
+// choice: mergeX is defined as PgBouncer's own center in buildDiagram(), by construction.
+var PGBOUNCER = {id:"pgbouncer", name:"PgBouncer", cat:"pgbouncer", x:260, y:985, w:660, h:56,
+  pop:{title:"PgBouncer", cat:"Connection pooler", rows:[
+    ["listen_port","6432"],["pool_mode","transaction"],["max_client_conn","200"],
+    ["default_pool_size","50"],["min_pool_size","10"],["reserve_pool_size","10"],["reserve_pool_timeout","5s"]
+  ], tag:"measured", note:"All pods connect to Postgres through PgBouncer, never directly."}};
+
+var POSTGRES = {id:"postgres", name:"PostgreSQL 16", cat:"pg", x:260, y:1075, w:660, h:250,
+  pop:{title:"PostgreSQL 16", cat:"Instance-level configuration (host-based, not a K8s pod)", rows:[
+    ["shared_buffers","8 GB"],["work_mem","16 MB"],["maintenance_work_mem","2 GB"],
+    ["effective_cache_size","15.5 GB"],["max_connections","300"]
+  ], tag:"measured", note:"These settings are instance-wide, not per-database — click a database below for its own details."}};
+
+var DAS = {id:"das", name:"Direct-Attached Storage", cat:"das", x:260, y:1355, w:660, h:70,
+  pop:{title:"Direct-Attached Storage", cat:"Postgres's own disk — not NFS", rows:[], tag:"measured",
+  note:"Postgres has its own dedicated gp3 volume on the Storage Node — it does not share the NFS export that MinIO/Kafka use. Sized from this registry's current Tab 1 inputs, not a fixed default.",
+  dynamicRows:function(){
+    var used = 0; DATABASES.forEach(function(d){ used += d.size; });
+    var recommended = used * 1.3; // 30% headroom over today's computed usage
+    return [["Used, at your inputs", fmtGB(used)], ["Recommended volume (+30% headroom)", fmtGB(recommended)+" gp3"]];
+  }}};
+
+// Database metadata -- .size (GB) and .sizeLabel are computed fresh each render from MODEL.
+// {regsnake} (farmer_registry) includes its supporting tables' estimated storage, not a
+// separate database -- a Postgres schema's tables all live in the one database.
+var DATABASES = [
+  {name:"{regsnake}", owner:"{reg}-staff-api, {reg}-partner-api, {reg}-celery-beat, {reg}-celery-worker (includes the Supporting Tables estimate and the Change Request / Intake Submission accumulation over Tab 1's sizing-years horizon)", tag:"measured", sizeKind:"main"},
+  {name:"master_data", owner:"master-data-api (cross-DB reads from registry pods)", tag:"assumed", sizeKind:"fixed", fixedGB:ASSUMED_DB_GB.masterdata},
+  {name:"awe", owner:"awe-staff-api", tag:"assumed", sizeKind:"fixed", fixedGB:ASSUMED_DB_GB.awe},
+  {name:"audit_manager", owner:"audit-manager-api", tag:"assumed", sizeKind:"auditmgr",
+   note:"Sized from Tab 1's Staff UI Change Request / Intake Submission / Search volumes over the sizing-years horizon, rebuilt from the real AuditMiddleware source: no request payload is ever captured (every audited call is a near-constant ~720-byte actor+outcome+context event), one Intake Submission create is 10 audited calls (one per form section), and Partner API volume is excluded because it isn't actually audited on success under the current middleware. See AUDIT_EVENT_BYTES. Not a fixed default."},
+  {name:"{regsnake}_idgenerator", owner:"id-generator-api", tag:"assumed", sizeKind:"fixed", fixedGB:ASSUMED_DB_GB.idgenerator},
+  {name:"keycloak", owner:"keycloak", tag:"assumed", sizeKind:"fixed", fixedGB:ASSUMED_DB_GB.keycloak},
+  {name:"partner_management", owner:"partner-management-api", tag:"assumed", sizeKind:"fixed", fixedGB:ASSUMED_DB_GB.partnermgr},
+  {name:"connector", owner:"registry-connector-api, -worker, -beat", tag:"assumed", sizeKind:"fixed", fixedGB:ASSUMED_DB_GB.connector}
+];
+
+// x-aligned with the thirdpartyNfs column center, so its one incoming arrow is vertical
+// (it only needs to land within NFS's top edge, not match NFS's own center exactly).
+var NFS = {id:"nfs", name:"NFS Storage", cat:"storage", x:960, y:1075, w:240, h:330,
+  pop:{title:"NFS Storage", cat:"Shared export on the Storage Node", rows:[], tag:"measured",
+    note:"PVC “sizes” below are Kubernetes bookkeeping, not enforced quotas — all three partitions share one real filesystem. Size for the shared total, not each partition independently.",
+  dynamicRows:function(){
+    var rows = PARTITIONS.map(function(p){ return [p.name, fmtGB(p.size)]; });
+    var total = 0; PARTITIONS.forEach(function(p){ total += p.size; });
+    rows.push(["Total NFS, at your inputs", fmtGB(total)]);
+    return rows;
+  }}};
+
+var PARTITIONS = [
+  {name:"loki-minio", detail:"Loki's own log chunks.", pvc:"observability/loki-minio, 50Gi declared", sizeKind:"loki"},
+  {name:"commons-minio", detail:"Application object store: profile images, document templates, uploaded files.", pvc:"{ns}/commons-minio, 16Gi declared", sizeKind:"commonsMinio"},
+  {name:"commons-kafka-controller", detail:"WebSub's Kafka broker data.", pvc:"{ns}/data-commons-kafka-controller-0, 8Gi declared", sizeKind:"kafka"}
+];
+
+// ----------------------------------------------------------- GEOMETRY -----
+function computeBoxGeometry(){
+  PODS.forEach(function(p){
+    p.x = COL_X[p.col];
+    p.y = COL_Y0 + p.row*66;
+    p.w = W; p.h = H;
+    if (p.sizing.kind === "staffApi") p.podsN = MODEL.staffApiPods;
+    else if (p.sizing.kind === "celeryWorker") p.podsN = MODEL.celeryWorkerPods;
+    else if (p.sizing.kind === "partnerApi") p.podsN = MODEL.partnerApiPods;
+    else p.podsN = p.sizing.n;
+  });
+
+  DATABASES.forEach(function(db){
+    // Supporting Tables storage is folded into the main database's own size, not a
+    // separate database entry -- a Postgres schema's tables all live in one database.
+    // txnDbGrowthGB is the Change Request / Intake Submission accumulation over the
+    // Tab 1 "years to be considered" horizon, also folded in here rather than its
+    // own line, since it's the same database growing, not a separate one.
+    if (db.sizeKind === "main") db.size = MODEL.mainDbGB + MODEL.tableStorageGB + MODEL.txnDbGrowthGB;
+    else if (db.sizeKind === "auditmgr") db.size = MODEL.auditMgrGB;
+    else db.size = db.fixedGB;
+  });
+  var dbCols = 3, dbW = 200, dbH = 52, dbGapX = 20, dbGapY = 14;
+  var dbStartX = POSTGRES.x + 10, dbStartY = POSTGRES.y + 44;
+  DATABASES.forEach(function(db, i){
+    db.x = dbStartX + (i % dbCols) * (dbW + dbGapX);
+    db.y = dbStartY + Math.floor(i / dbCols) * (dbH + dbGapY);
+    db.w = dbW; db.h = dbH;
+  });
+
+  PARTITIONS.forEach(function(part){
+    if (part.sizeKind === "loki") { part.size = MODEL.lokiGB; part.tag = "assumed"; }
+    else if (part.sizeKind === "commonsMinio") { part.size = MODEL.commonsMinioGB; part.tag = "assumed"; }
+    else { part.size = MODEL.kafkaGB; part.tag = "assumed"; }
+  });
+  var pW = 200, pH = 76, pGap = 16;
+  var pStartX = NFS.x + 20, pStartY = NFS.y + 44;
+  PARTITIONS.forEach(function(part, i){
+    part.x = pStartX;
+    part.y = pStartY + i*(pH+pGap);
+    part.w = pW; part.h = pH;
+  });
+}
+
+// ------------------------------------------------------------- RENDER -----
+var svg = document.getElementById('diagram');
+function vArrow(x1,y1,x2,y2){
+  return el('path',{d:"M"+x1+","+y1+" L"+x2+","+y2, fill:"none", stroke:ARROW_COLOR, "stroke-width":ARROW_WIDTH, class:"flow", "marker-end":"url(#arrow)"});
+}
+function orthoFeeder(points){
+  var d = "M"+points[0][0]+","+points[0][1];
+  for (var i=1;i<points.length;i++) d += " L"+points[i][0]+","+points[i][1];
+  return el('path',{d:d, fill:"none", stroke:ARROW_COLOR, "stroke-width":ARROW_WIDTH, class:"flow"});
+}
+// Same as orthoFeeder but with an arrowhead at the last point -- for a multi-segment
+// (but still purely horizontal/vertical, never diagonal) connector that terminates
+// in an arrow, e.g. a UI->API pair whose rows don't line up.
+function orthoArrow(points){
+  var d = "M"+points[0][0]+","+points[0][1];
+  for (var i=1;i<points.length;i++) d += " L"+points[i][0]+","+points[i][1];
+  return el('path',{d:d, fill:"none", stroke:ARROW_COLOR, "stroke-width":ARROW_WIDTH, class:"flow", "marker-end":"url(#arrow)"});
+}
+
+function drawBox(n, extraClass){
+  var g = el('g',{class:(extraClass||"box"), "data-id":n.id, tabindex:"0", role:"button", "aria-label":n.name});
+  g.appendChild(el('rect',{x:n.x,y:n.y,width:n.w,height:n.h,fill:n.fillVar||("var(--"+n.cat+"-bg, var(--surface))"),stroke:n.strokeVar||("var(--"+n.cat+")")}));
+  var lines = wrapName(n.name, n.wrapLen || 19);
+  var lh = 12.7; // +15%, matches the .t-name font-size bump
+  var startY = n.y + n.h/2 - ((lines.length-1)*lh)/2 + 3;
+  lines.forEach(function(line, i){
+    var t = el('text',{x:n.x+n.w/2,y:startY+i*lh,"text-anchor":"middle",class:"t-name",fill:"var(--ink)"});
+    t.textContent = line; g.appendChild(t);
+  });
+  return g;
+}
+function openPopForNode(n){ return function(e){ openPop(n, e.clientX, e.clientY); }; }
+
+function buildDiagram(){
+  readInputs();
+  deriveModel();
+
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  var defs = el('defs',{});
+  var marker = el('marker',{id:"arrow", markerWidth:8, markerHeight:8, refX:6, refY:3, orient:"auto"});
+  marker.appendChild(el('path',{d:"M0,0 L6,3 L0,6 Z", fill:ARROW_COLOR}));
+  defs.appendChild(marker);
+  svg.appendChild(defs);
+
+  computeBoxGeometry();
+
+  // ---- node-level outer boxes ----
+  NODES.forEach(function(n){
+    var g = drawBox({x:n.x,y:n.y,w:n.w,h:n.h,name:"",cat:n.cat,id:n.id}, "box");
+    var r = g.querySelector('rect');
+    r.setAttribute('fill','transparent'); // 'none' would make only the border pixel-line clickable
+    r.setAttribute('stroke','var(--nodebox)');
+    r.setAttribute('stroke-dasharray','3 5');
+    r.setAttribute('stroke-width','1.6');
+    var label = el('text',{x:n.x+18,y:n.y+26,class:"node-label"}); label.textContent = n.name;
+    g.appendChild(label);
+    g.addEventListener('click', openPopForNode(n));
+    g.addEventListener('keydown', function(e){ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); var r2=g.getBoundingClientRect(); openPop(n, r2.left+20, r2.top+20); }});
+    svg.appendChild(g);
+  });
+
+  // RP -> Compute Node: the only inter-node arrow.
+  var rp = NODES[0], cn = NODES[1];
+  svg.appendChild(vArrow(rp.x+rp.w/2, rp.y+rp.h, cn.x+cn.w/2, cn.y));
+
+  // WireGuard / Nginx inside Reverse Proxy Node
+  RP_SUB.forEach(function(n){
+    var g = drawBox(n);
+    g.addEventListener('click', openPopForNode(n));
+    svg.appendChild(g);
+  });
+
+  // cluster sub-labels inside Compute Node
+  var cl = el('text',{x:NODE_X+18,y:241,class:"node-sub"}); cl.textContent="Kubernetes Cluster — every pod below runs here";
+  svg.appendChild(cl);
+  var labels = [["ui","UI"],["api","API"],["celeryBeat","Celery Beat"],["celeryWorker","Celery Worker"],
+    ["thirdpartyPg","3rd Party — uses Postgres"],["thirdpartyNfs","3rd Party — uses NFS"],
+    ["thirdpartyNoPersist","3rd Party — no persistence"]];
+  labels.forEach(function(pair){
+    var t = el('text',{x:COL_X[pair[0]],y:263,class:"group-label"}); t.textContent = pair[1]; svg.appendChild(t);
+  });
+
+  // ---- 4 Postgres-feeding columns feed one merge point, then ONE single arrow drops
+  // into PgBouncer. mergeX is DEFINED as PgBouncer's own center, so the final arrow --
+  // and PgBouncer -> Postgres right after it -- are pure vertical lines by construction,
+  // regardless of where PgBouncer happens to sit relative to the columns above it. ----
+  var pgbTop = {x: PGBOUNCER.x+PGBOUNCER.w/2, y: PGBOUNCER.y};
+  var mergeX = pgbTop.x;
+  var busY = 955;
+  function colBottom(col){
+    var last = PODS.filter(function(p){return p.col===col;}).sort(function(a,b){return b.row-a.row;})[0];
+    return {x: last.x+last.w/2, y: last.y+last.h};
+  }
+  ["api","celeryBeat","celeryWorker","thirdpartyPg"].forEach(function(col){
+    var c = colBottom(col);
+    if (c.x === mergeX) svg.appendChild(orthoFeeder([[c.x,c.y],[c.x,busY]]));
+    else svg.appendChild(orthoFeeder([[c.x,c.y],[c.x,busY],[mergeX,busY]]));
+  });
+  svg.appendChild(vArrow(mergeX, busY, pgbTop.x, pgbTop.y));
+
+  // PgBouncer -> Postgres: same width + same x, pure vertical line.
+  svg.appendChild(vArrow(PGBOUNCER.x+PGBOUNCER.w/2, PGBOUNCER.y+PGBOUNCER.h, POSTGRES.x+POSTGRES.w/2, POSTGRES.y));
+
+  // Postgres -> DAS: same width + same x, pure vertical line (Postgres's own disk, not NFS).
+  svg.appendChild(vArrow(POSTGRES.x+POSTGRES.w/2, POSTGRES.y+POSTGRES.h, DAS.x+DAS.w/2, DAS.y));
+
+  // ---- NFS: ONE single straight vertical arrow, x-aligned with the thirdpartyNfs
+  // column so it never bends. Starts below that column's lowest pod. ----
+  var nfsColX = COL_X.thirdpartyNfs + W/2;
+  var lastNfsPod = colBottom("thirdpartyNfs");
+  svg.appendChild(vArrow(nfsColX, lastNfsPod.y, nfsColX, NFS.y));
+
+  // ---- pod boxes: fill = OpenG2P/non-OpenG2P origin, border = QoS class ----
+  // (openg2p-staff-ui is the one deliberate exception -- `highlight:"landing"` gives
+  // it the gold landing-page fill instead, to set the common staff-portal home page
+  // visually apart from every other UI pod, while its border still follows the usual
+  // QoS rule like everything else. In API / Celery Beat / Celery Worker -- where every
+  // pod is OpenG2P-built, so the origin fill would be uniform -- fill instead carries
+  // QoS x measured/assumed; see the palette comment at the top of the file.)
+  var QOS_TAG_FILL_COLS = {api:1, celeryBeat:1, celeryWorker:1};
+  PODS.forEach(function(n){
+    var origin = originOf(n), qos = qosOf(n);
+    if (QOS_TAG_FILL_COLS[n.col]){
+      n.fillVar = qos === "guaranteed"
+        ? (n.tag === "measured" ? "var(--qtag-gm-bg)" : "var(--qtag-ga-bg)")
+        : (n.tag === "measured" ? "var(--qtag-bm-bg)" : "var(--qtag-ba-bg)");
+    } else {
+      n.fillVar = n.highlight === "landing" ? "var(--landing-bg)" : origin === "openg2p" ? "var(--openg2p-bg)" : "var(--nonopeng2p-bg)";
+    }
+    // burstable+assumed OpenG2P pods in these 3 columns share the same grey fill
+    // as 3rd-party pods elsewhere -- without a border override too they'd be
+    // indistinguishable at a glance. Blue border breaks that collision; every
+    // other combination (including 3rd-party, untouched) keeps the plain QoS border.
+    n.strokeVar = (QOS_TAG_FILL_COLS[n.col] && qos === "burstable" && n.tag === "assumed")
+      ? "var(--qtag-ba-border)"
+      : qos === "guaranteed" ? "var(--qos-guaranteed-border)" : "var(--qos-burstable-border)";
+    n.displayName = tplName(n.name);
+    var g = drawBox({x:n.x,y:n.y,w:n.w,h:n.h,name:n.displayName,fillVar:n.fillVar,strokeVar:n.strokeVar,id:n.id});
+    g.addEventListener('click', openPopForNode(n));
+    g.addEventListener('keydown', function(e){ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); var r2=g.getBoundingClientRect(); openPop(n, r2.left+r2.width/2, r2.top); }});
+    svg.appendChild(g);
+  });
+
+  // ---- UI -> API arrows, only where a corresponding API pod exists. Straight
+  // when the pair's rows line up; otherwise a 3-segment orthogonal elbow (never
+  // diagonal) bent at the midpoint of the UI->API gap. ----
+  function podById(id){ return PODS.filter(function(p){ return p.id===id; })[0]; }
+  UI_API_PAIRS.forEach(function(pair){
+    var uiPod = podById(pair[0]), apiPod = podById(pair[1]);
+    var uiRight = uiPod.x+uiPod.w, uiY = uiPod.y+uiPod.h/2;
+    var apiLeft = apiPod.x, apiY = apiPod.y+apiPod.h/2;
+    if (uiPod.row === apiPod.row){
+      svg.appendChild(vArrow(uiRight, uiY, apiLeft, apiY));
+    } else {
+      var bendX = (uiRight+apiLeft)/2;
+      svg.appendChild(orthoArrow([[uiRight,uiY],[bendX,uiY],[bendX,apiY],[apiLeft,apiY]]));
+    }
+  });
+
+  // ---- PgBouncer ----
+  var gpb = drawBox(PGBOUNCER);
+  gpb.addEventListener('click', openPopForNode(PGBOUNCER));
+  svg.appendChild(gpb);
+
+  // ---- Postgres container + DB sub-boxes ----
+  var gpg = el('g',{class:"box", "data-id":"postgres"});
+  gpg.appendChild(el('rect',{x:POSTGRES.x,y:POSTGRES.y,width:POSTGRES.w,height:POSTGRES.h,fill:"var(--pg-bg)",stroke:"var(--pg)"}));
+  var pgLabel = el('text',{x:POSTGRES.x+18,y:POSTGRES.y+26,class:"node-sub",style:"font-weight:700;fill:var(--pg)"});
+  pgLabel.textContent = POSTGRES.name + " — click a database for its details";
+  gpg.appendChild(pgLabel);
+  gpg.addEventListener('click', function(e){ if (e.target===gpg.querySelector('rect') || e.target===pgLabel) openPop(POSTGRES, e.clientX, e.clientY); });
+  svg.appendChild(gpg);
+  DATABASES.forEach(function(db){
+    db.displayName = tplName(db.name);
+    var g = el('g',{class:"subbox", "data-id":db.displayName});
+    g.appendChild(el('rect',{x:db.x,y:db.y,width:db.w,height:db.h,fill:"var(--db-sub-bg)",stroke:"var(--db-sub)"}));
+    var lines = wrapName(db.displayName, 20);
+    lines.forEach(function(line,i){
+      var t = el('text',{x:db.x+db.w/2,y:db.y+db.h/2 - ((lines.length-1)*12.7)/2 + 3 + i*12.7,"text-anchor":"middle",class:"t-name",fill:"var(--ink)"});
+      t.textContent = line; g.appendChild(t);
+    });
+    g.addEventListener('click', function(e){ e.stopPropagation(); openPopForDb(db, e.clientX, e.clientY); });
+    svg.appendChild(g);
+  });
+
+  // ---- DAS ----
+  var gdas = drawBox(DAS, "box");
+  gdas.addEventListener('click', openPopForNode(DAS));
+  svg.appendChild(gdas);
+
+  // ---- NFS container + partition sub-boxes ----
+  var gnfs = el('g',{class:"box", "data-id":"nfs"});
+  gnfs.appendChild(el('rect',{x:NFS.x,y:NFS.y,width:NFS.w,height:NFS.h,fill:"var(--storage-bg)",stroke:"var(--storage)"}));
+  var nfsLabel = el('text',{x:NFS.x+14,y:NFS.y+22,class:"node-sub",style:"font-weight:700;fill:var(--storage)"});
+  nfsLabel.textContent = NFS.name;
+  gnfs.appendChild(nfsLabel);
+  gnfs.addEventListener('click', function(e){ if (e.target===gnfs.querySelector('rect') || e.target===nfsLabel) openPop(NFS, e.clientX, e.clientY); });
+  svg.appendChild(gnfs);
+  PARTITIONS.forEach(function(part){
+    part.displayPvc = tplNs(part.pvc);
+    var g = el('g',{class:"subbox", "data-id":part.name});
+    g.appendChild(el('rect',{x:part.x,y:part.y,width:part.w,height:part.h,fill:"var(--partition-sub-bg)",stroke:"var(--partition-sub)"}));
+    var lines = wrapName(part.name, 18);
+    lines.forEach(function(line,i){
+      var t = el('text',{x:part.x+part.w/2,y:part.y+23+i*13.8,"text-anchor":"middle",class:"t-name",fill:"var(--ink)"});
+      t.textContent = line; g.appendChild(t);
+    });
+    var u = el('text',{x:part.x+part.w/2,y:part.y+part.h-11.5,"text-anchor":"middle",class:"t-sub",fill:"var(--ink-soft)"});
+    u.textContent = fmtGB(part.size); g.appendChild(u);
+    g.addEventListener('click', function(e){ e.stopPropagation(); openPopForPartition(part, e.clientX, e.clientY); });
+    svg.appendChild(g);
+  });
+}
+
+// ----------------------------------------------------------- POPOVER ------
+var pop = document.getElementById('pop');
+var overlay = document.getElementById('popOverlay');
+
+function renderRows(rows){
+  return rows.map(function(r){ return '<dt>'+r[0]+'</dt><dd>'+r[1]+'</dd>'; }).join('');
+}
+
+function positionAndShow(clientX, clientY){
+  pop.classList.add('show');
+  overlay.classList.add('show');
+  var vw = window.innerWidth, vh = window.innerHeight;
+  var pw = Math.min(560, vw - 32); // must track the CSS .pop max-width exactly, or the clamp below goes off-screen
+  var left = Math.min(Math.max(12, clientX - pw/2), vw - pw - 12);
+  var top = clientY + 16;
+  pop.style.left = left+"px";
+  var ph = pop.offsetHeight || 220;
+  if (top + ph > vh - 12) top = Math.max(12, clientY - ph - 16);
+  pop.style.top = top+"px";
+}
+
+// Pods carry {request, limit, podsN} instead of static display rows -- build rows
+// fresh so the popover always reflects the current Tab 1 inputs.
+function podRows(n){
+  return [
+    ["vCPU request / limit", n.request.vcpu+" / "+n.limit.vcpu],
+    ["RAM request / limit", n.request.ramGB+" GB / "+n.limit.ramGB+" GB"],
+    ["Pods", n.podsN],
+    ["Persists to", persistLabel(persistOf(n))]
+  ];
+}
+
+function openPop(n, clientX, clientY){
+  var isPod = !!n.request;
+  var rows = isPod ? podRows(n) : n.pop.rows.slice();
+  var tagVal = isPod ? n.tag : n.pop.tag;
+  var noteVal = isPod ? n.note : n.pop.note;
+  var titleVal = isPod ? n.displayName : (n.pop.title||n.name);
+  var catVal = isPod ? CAT_LABELS[n.builtBy] : (n.pop.cat||"");
+  if (!isPod && n.pop.dynamicRows) rows = rows.concat(n.pop.dynamicRows());
+
+  if (n.id === "computenode"){
+    // Guaranteed = request==limit, so its own total is unambiguous. Burstable is
+    // split into its Requests total (the floor) and Limits total (the ceiling if
+    // every burstable pod burst at once) -- Recommended assumes that won't happen
+    // simultaneously and only budgets half of the gap between the two.
+    var gVcpu=0, gRam=0, brVcpu=0, brRam=0, blVcpu=0, blRam=0;
+    PODS.forEach(function(p){
+      if (p.qos === "guaranteed"){ gVcpu += p.request.vcpu*p.podsN; gRam += p.request.ramGB*p.podsN; }
+      else { brVcpu += p.request.vcpu*p.podsN; brRam += p.request.ramGB*p.podsN;
+             blVcpu += p.limit.vcpu*p.podsN; blRam += p.limit.ramGB*p.podsN; }
+    });
+    var recVcpu = gVcpu + K8S_OVERHEAD_VCPU + brVcpu + 0.5*(blVcpu-brVcpu);
+    var recRam  = gRam  + K8S_OVERHEAD_RAM_GB + brRam  + 0.5*(blRam-brRam);
+    var combo = suggestInstanceCombo(recVcpu, recRam);
+    rows = rows.concat([
+      ["Total vCPU required for the PODs", ""],
+      ["— Guaranteed", gVcpu],
+      ["— Burstable Requests", brVcpu],
+      ["— Burstable Limits", blVcpu],
+      ["— Overhead for Kubernetes", K8S_OVERHEAD_VCPU],
+      ["— Recommended", Math.ceil(recVcpu)],
+      ["", ""],
+      ["Total RAM required for the PODs", ""],
+      ["— Guaranteed", gRam+" GB"],
+      ["— Burstable Requests", brRam+" GB"],
+      ["— Burstable Limits", blRam+" GB"],
+      ["— Overhead for Kubernetes", K8S_OVERHEAD_RAM_GB+" GB"],
+      ["— Recommended", Math.ceil(recRam)+" GB"]
+    ]);
+  }
+  if (n.id === "storagenode"){
+    var totalDbGB = 0; DATABASES.forEach(function(d){ totalDbGB += d.size; });
+    var totalNfsGB = 0; PARTITIONS.forEach(function(p){ totalNfsGB += p.size; });
+    rows = rows.concat([["Total DB storage required", fmtGB(totalDbGB)], ["Total NFS storage required", fmtGB(totalNfsGB)]]);
+  }
+
+  var html = '<button class="close" aria-label="Close">×</button>';
+  html += '<h4>'+titleVal+'</h4>';
+  if (n.ns) html += '<span class="ns">namespace: '+tplNs(n.ns)+(n.kind?' · '+n.kind:'')+'</span><br>';
+  html += '<div class="cat">'+catVal+'</div><dl>'+renderRows(rows)+'</dl>';
+  html += '<span class="tag tag-'+tagVal+'">'+tagVal+'</span>';
+  if (isPod) html += '<span class="tag tag-'+n.qos+'">'+n.qos+'</span>';
+  if (n.id === "pgbouncer"){
+    var dbList = DATABASES.map(function(d){
+      return '<div class="conn-row"><span class="mono" style="font-weight:600">'+d.displayName+'</span><span class="mono conn-url">postgresql://pgbouncer:6432/'+d.displayName+'</span></div>';
+    }).join('');
+    html += '<div class="note"><strong>Connection strings, per database</strong><div class="partlist">'+dbList+'</div></div>';
+  }
+  if (n.id === "computenode"){
+    var instanceList = combo.parts.map(function(line){
+      return '<div class="partrow instance-line"><span>'+line+'</span></div>';
+    }).join('');
+    html += '<div class="note"><strong>Suggested Instance in AWS</strong><div class="partlist">'+instanceList+'</div></div>';
+  }
+  if (noteVal) html += '<div class="note">'+noteVal+'</div>';
+  pop.innerHTML = html;
+  pop.querySelector('.close').addEventListener('click', closePop);
+  positionAndShow(clientX, clientY);
+}
+
+function openPopForDb(db, clientX, clientY){
+  var html = '<button class="close" aria-label="Close">×</button>';
+  html += '<h4>'+db.displayName+'</h4><div class="cat">Database inside PostgreSQL 16</div>';
+  html += '<dl><dt>Used by</dt><dd style="text-align:left">'+db.owner+'</dd><dt>Size</dt><dd>'+fmtGB(db.size)+'</dd></dl>';
+  html += '<span class="tag tag-'+db.tag+'">'+db.tag+'</span>';
+  if (db.note) html += '<div class="note">'+db.note+'</div>';
+  html += '<div class="note">Connection pool / memory settings are instance-wide — see the PostgreSQL 16 box, not this database specifically.</div>';
+  pop.innerHTML = html;
+  pop.querySelector('.close').addEventListener('click', closePop);
+  positionAndShow(clientX, clientY);
+}
+
+function openPopForPartition(part, clientX, clientY){
+  var html = '<button class="close" aria-label="Close">×</button>';
+  html += '<h4>'+part.name+'</h4><div class="cat">NFS partition</div>';
+  html += '<dl><dt>Backs</dt><dd style="text-align:left">'+part.detail+'</dd><dt>PVC</dt><dd style="text-align:left">'+part.displayPvc+'</dd><dt>Used</dt><dd>'+fmtGB(part.size)+'</dd></dl>';
+  html += '<span class="tag tag-'+part.tag+'">'+part.tag+'</span>';
+  html += '<div class="note">PVC-declared size is not an enforced quota — all three partitions share one real filesystem.</div>';
+  pop.innerHTML = html;
+  pop.querySelector('.close').addEventListener('click', closePop);
+  positionAndShow(clientX, clientY);
+}
+
+function closePop(){ pop.classList.remove('show'); overlay.classList.remove('show'); }
+overlay.addEventListener('click', closePop);
+document.addEventListener('keydown', function(e){ if(e.key==="Escape") closePop(); });
+
+document.querySelectorAll('.tab-btn').forEach(function(btn){
+  btn.addEventListener('click', function(){
+    document.querySelectorAll('.tab-btn').forEach(function(b){b.classList.remove('active');});
+    document.querySelectorAll('.tabpanel').forEach(function(p){p.classList.remove('active');});
+    btn.classList.add('active');
+    document.getElementById(btn.dataset.tab).classList.add('active');
+  });
+});
+
+BIG_NUMBER_IDS.forEach(function(id){
+  document.getElementById(id).addEventListener('input', formatBigNumberInput);
+});
+
+['inNamespace','inRegistryName','inPrimaryRecords','inSecondaryRegisters','inSupportingTables',
+ 'inIntakeForms','inRatioSecondaryRecords','inRatioTableRecords','inMaxFileSizeKB','inFilesPerRecord','inConcurrentUsers','inStaffTxnPerDay',
+ 'inStaffSearchTxnPerDay','inNumPartners','inPartnerTxnPerDay','inPartnerSearchTxnPerDay','inLogRetention','inSizingYears'].forEach(function(id){
+  document.getElementById(id).addEventListener('input', buildDiagram);
+});
+
+buildDiagram();
+})();
+</script>
