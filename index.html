@@ -513,6 +513,23 @@ var STORAGE_POINTS = [[10150268,139.3],[50000264,715.1]]; // farmer-registry row
 var PARTNER_SEARCH_RATES = [3.33, 5.36, 5.10];
 var PARTNER_INGEST_RATES = [85.74, 141.13, 187.91];
 
+// Kafka (commons-kafka-controller) carries exactly one payload in this architecture:
+// the on-search envelope partner-api's async mode publishes to the PARTNER_STAFF_PORTAL
+// WebSub topic -- one page of matched farmer records per async search call (sync returns
+// its page over HTTP instead, never touching Kafka). AVG_SEARCH_RESPONSE_BYTES is the
+// real measured page-of-100-records response size (partner-api/raw-report.md, Sync pod-1,
+// "Average Content Size" column) for the same three range query types PARTNER_SEARCH_RATES
+// blends -- expression_p100 555722.68, graphql_p100 553889.91, predicate_p100 554285.24
+// bytes, averaged. Single Farmer Search using ID is excluded as the same outlier as above
+// (a 1-record response, ~6.7KB, not a representative page). Used as a stand-in for the
+// Kafka message size on the (reasonable) assumption that the async on-search envelope
+// carries a comparable page of records plus comparable envelope overhead to its sync
+// counterpart -- the actual Kafka message was never captured directly. KAFKA_RETENTION_DAYS
+// is Kafka's own out-of-the-box default (log.retention.hours=168), not a registry-specific
+// measurement -- no commons-kafka retention override was found in this registry's config.
+var AVG_SEARCH_RESPONSE_BYTES = 554633; // (555722.68 + 553889.91 + 554285.24) / 3
+var KAFKA_RETENTION_DAYS = 7;
+
 function clamp(v,lo,hi){ return Math.max(lo,Math.min(hi,v)); }
 function num(id, dflt, lo, hi){
   var e = document.getElementById(id);
@@ -646,7 +663,14 @@ function deriveModel(){
   var dailyLogGB = dailyLogBytes / 1e9;
   var lokiGB = dailyLogGB * INPUTS.logRetention;
   var commonsMinioGB = (totalDocuments * (INPUTS.maxFileSizeKB / 1024)) / 1024; // KB -> MB -> GB
-  var kafkaGB = 2;
+
+  // Kafka holds the async on-search envelope only -- assuming all Partner Search
+  // traffic is async (per Tab 1's Search Transactions/day for Partners), one envelope
+  // per search, sized off the real measured page-of-100 response size. A rolling
+  // retention window (Kafka's own default), not an accumulate-forever horizon --
+  // see AVG_SEARCH_RESPONSE_BYTES / KAFKA_RETENTION_DAYS above.
+  var dailyKafkaBytes = INPUTS.partnerSearchTxnPerDay * AVG_SEARCH_RESPONSE_BYTES;
+  var kafkaGB = (dailyKafkaBytes * KAFKA_RETENTION_DAYS) / 1e9;
 
   // Audit Manager's audit_events table accumulates permanently too (7-year default
   // retention per its own technical-architecture.md), so like the Change Request /
@@ -911,7 +935,7 @@ var NFS = {id:"nfs", name:"NFS Storage", cat:"storage", x:960, y:1075, w:240, h:
 var PARTITIONS = [
   {name:"loki-minio", detail:"Loki's own log chunks.", pvc:"observability/loki-minio, 50Gi declared", sizeKind:"loki"},
   {name:"commons-minio", detail:"Application object store: profile images, document templates, uploaded files.", pvc:"{ns}/commons-minio, 16Gi declared", sizeKind:"commonsMinio"},
-  {name:"commons-kafka-controller", detail:"WebSub's Kafka broker data.", pvc:"{ns}/data-commons-kafka-controller-0, 8Gi declared", sizeKind:"kafka"}
+  {name:"commons-kafka-controller", detail:"WebSub's Kafka broker data -- holds the async on-search envelope published per Partner Search (assuming all Partner Search traffic is async), sized off the measured page-of-100 response size and Kafka's own default 7-day retention.", pvc:"{ns}/data-commons-kafka-controller-0, 8Gi declared", sizeKind:"kafka"}
 ];
 
 // ----------------------------------------------------------- GEOMETRY -----
