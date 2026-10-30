@@ -1,3 +1,13 @@
+<!--
+  SIZING METHODOLOGY REFERENCE -- read this before changing any formula/constant below.
+  Every constant and formula in this file (measured benchmark numbers, assumed
+  placeholders, drain-time goals, audit/Kafka/celery modeling decisions, known
+  simplifications, and a machine-readable JSON mirror of all of it) is indexed in
+  SIZING_METHODOLOGY.md, next to this file in the same repo. That file exists
+  specifically so a future revision can be made correctly without the original
+  chat conversation that built this tool. Update it in the same commit as any
+  change here.
+-->
 <title>Registry - Hardware Sizing and Estimation</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&family=Roboto+Mono:wght@400;500&display=swap">
 <style>
@@ -302,7 +312,7 @@ footer{max-width:1340px;margin:30px auto 0;padding:16px 20px;color:var(--ink-fai
             <input type="text" inputmode="numeric" id="inPartnerSearchTxnPerDay" value="5,000">
             <div class="in-hint">Sizes <code>loki-minio</code> on the Architecture tab, at a measured 2,175 bytes of log per sync search. Also checked against partner-api's measured DCI search capacity curve (sync RPS at pod 1/2/3, blended across the range query types) — whichever of this and Transactions/day above demands more pods wins.</div>
           </div>
-          <div class="in-hint">Combines with Section 4's Staff UI transaction count to size celery-worker pods (register-write + intake-ingest pipelines), the farmer_registry database's accumulated growth, and part of loki-minio's log volume (partner-api is assumed to log the same as staff-api for CR creation/intake submission). Transactions/day and Search Transactions/day above also now size partner-api's own pod count directly, against its measured capacity curves.</div>
+          <div class="in-hint">Combines with Section 4's Staff UI transaction count to size celery-worker pods — against a 12-hour drain-time goal for the 7 queues a day's Change Requests/Intake Submissions populate (register ingest, ID Generation, Deduplication, Completion Score, Score Compute), checked against the celery benchmark's real Blended (all-queues-concurrently) drain rate — the farmer_registry database's accumulated growth, and part of loki-minio's log volume (partner-api is assumed to log the same as staff-api for CR creation/intake submission). Transactions/day and Search Transactions/day above also now size partner-api's own pod count directly, against its measured capacity curves.</div>
         </div>
 
         <div class="in-card">
@@ -491,11 +501,32 @@ function suggestInstanceCombo(vcpuNeeded, ramNeeded){
 // Measured capacity curves, ported from the staff-api / celery benchmark reports.
 var STAFF_TIERS = [10150268, 50000264];
 var STAFF_CAPS  = [[184,319,453],[164,329,369]]; // real concurrent users at pod 1/2/3, e2e ingress
-// Celery combined curve = "register write (new)" + "register ingest" pipelines (rows/min, pod 1/2/3) --
-// a simplified stand-in for the 15-pipeline blended benchmark, since Tab 1 only collects two aggregate
-// transaction-volume numbers rather than a per-pipeline breakdown. Tagged "assumed" in the popover for
-// that reason even though the underlying rates are real measured numbers.
-var CELERY_COMBINED_RATES = [2284, 4116, 5425];
+// Celery-worker pod count is sized to a drain-time goal, not a raw throughput ceiling --
+// see celery/final-report-summary.md "Blended (all 14 scenarios concurrently)": one beat
+// pod + N worker pods draining all 14 measured queue types at once (not one at a time),
+// each seeded to a uniform 10,000-row backlog (140,000 rows total). That's the only real
+// benchmark where every queue type contends for the same worker pool simultaneously --
+// exactly this registry's situation -- so it's used as-is rather than summing 14 separate
+// isolated-run curves (which would overstate capacity: isolated runs don't compete for
+// the same CPU/DB connections).
+// CELERY_BLENDED_DRAIN_RATES is rows/min actually achieved, back-computed from that report's
+// window + finish data (total backlog minus each straggler's reported shortfall, divided by
+// the window):
+//   Pod-1: 112 min window, 4 stragglers all >=99.7% done (<=30 rows short each) -> ~139,880/112 = 1249
+//   Pod-2: 64 min window, same 4 stragglers all >=98.6% done (<=140 rows short each) -> ~139,440/64 = 2179
+//   Pod-3: 73 min window; two stragglers (change_request_ingest, ingest_data) regress hard here --
+//          1,166 and 1,091 rows still in_progress out of 10,000 (the report's own headline finding:
+//          these two, sharing one beat producer, get WORSE at pod-3, not better) -- the other two
+//          stragglers' pod-3 shortfall isn't separately reported, so their pod-2 rate (140 each) is
+//          reused as a stand-in -> ~137,463/73 = 1883 raw.
+// Raw pod-3 (1883) is BELOW pod-2 (2179) -- a real, documented regression, not a typo. Flooring pod-3
+// at pod-2's rate for this lookup table avoids ever recommending pod-3 as if it drains faster than
+// pod-2 (it measurably doesn't); it also means the podsNeeded() extrapolation beyond pod-3 sees a flat
+// (not negative) marginal gain and caps at 3 pods rather than guessing at a slope the benchmark never
+// demonstrated. A registry whose computed need exceeds pod-3's drain rate is hitting a real contention
+// ceiling the benchmark found (not a "add more pods" problem) -- see the celery-worker pod's note.
+var CELERY_BLENDED_DRAIN_RATES = [1249, 2179, 2179]; // rows/min, pod 1/2/3 -- pod-3 floored at pod-2, see above
+var DRAIN_GOAL_HOURS = 12; // goal: fully drain a day's queue volume within this window
 var STORAGE_POINTS = [[10150268,139.3],[50000264,715.1]]; // farmer-registry rows -> total Postgres GB
 
 // Partner-api benchmark (see partner-api/final-report-summary.md): 2 vCPU limit,
@@ -509,7 +540,7 @@ var STORAGE_POINTS = [[10150268,139.3],[50000264,715.1]]; // farmer-registry row
 // path, not the partner pod itself, so sync is what actually stresses this pod's
 // capacity. PARTNER_INGEST_RATES is the raw Ingest API RPS (one curve, no blending
 // needed). Tagged "assumed" in the popover for the range-type blend, same as
-// CELERY_COMBINED_RATES, even though every underlying number is measured.
+// CELERY_BLENDED_DRAIN_RATES below, even though every underlying number is measured.
 var PARTNER_SEARCH_RATES = [3.33, 5.36, 5.10];
 var PARTNER_INGEST_RATES = [85.74, 141.13, 187.91];
 
@@ -623,8 +654,21 @@ function deriveModel(){
   var staffNeed = INPUTS.concurrentUsers / (1 - HEADROOM);
   var staffApiPods = podsNeeded(staffCaps, staffNeed);
 
-  var celeryNeedRate = (totalDailyTxns / 1440) / (1 - HEADROOM);
-  var celeryWorkerPods = podsNeeded(CELERY_COMBINED_RATES, celeryNeedRate);
+  // celery-worker pods are sized to drain a full day's queue volume within DRAIN_GOAL_HOURS,
+  // against the real blended (all-queues-concurrently) drain rate -- see
+  // CELERY_BLENDED_DRAIN_RATES above. Queue volume is the sum of every queue type a Change
+  // Request or Intake Submission populates, kept unsimplified below so each term traces to
+  // one real queue:
+  var celeryQueueItemsPerDay =
+      totalCrPerDay       // 1. Change Request ingest (change_request_ingest)
+    + totalIntakePerDay   // 2. Intake Submission ingest (intake_register_ingest)
+    + totalIntakePerDay   // 3. Intake Submission -> ID Generation queue (functional_id_allocation)
+    + totalCrPerDay       // 4. Change Request -> Deduplication queue (dedup_cr_vs_register)
+    + totalIntakePerDay   // 5. Intake Submission -> Deduplication queue (dedup_intake_vs_register/intake)
+    + totalCrPerDay + totalIntakePerDay // 6. Change Request + Intake Submission -> Completion Score queue
+    + totalIntakePerDay;  // 7. Intake Submission -> Score Compute queue (score_compute)
+  var celeryNeedRate = (celeryQueueItemsPerDay / (DRAIN_GOAL_HOURS * 60)) / (1 - HEADROOM);
+  var celeryWorkerPods = podsNeeded(CELERY_BLENDED_DRAIN_RATES, celeryNeedRate);
 
   // partner-api pods must cover whichever of its two measured endpoint types demands
   // more capacity -- search (much lower RPS ceiling per pod) and ingest (much higher) --
@@ -691,7 +735,7 @@ function deriveModel(){
     totalRegisterRecords: totalRegisterRecords, totalTableRecords: totalTableRecords, totalDocuments: totalDocuments,
     totalDailyTxns: totalDailyTxns, totalCrPerDay: totalCrPerDay, totalIntakePerDay: totalIntakePerDay,
     staffApiPods: staffApiPods, staffNeed: staffNeed, staffCapAtPods: staffCaps[Math.min(staffApiPods,3)-1],
-    celeryWorkerPods: celeryWorkerPods, celeryNeedRate: celeryNeedRate,
+    celeryWorkerPods: celeryWorkerPods, celeryNeedRate: celeryNeedRate, celeryQueueItemsPerDay: celeryQueueItemsPerDay,
     partnerApiPods: partnerApiPods, partnerSearchNeedRate: partnerSearchNeedRate, partnerIngestNeedRate: partnerIngestNeedRate,
     mainDbGB: mainDbGB, storageExtrapolated: storageExtrapolated, tableStorageGB: tableStorageGB,
     txnDbGrowthGB: txnDbGrowthGB, dailyLogGB: dailyLogGB,
@@ -820,7 +864,7 @@ var PODS = [
   // derived count; registry-connector-worker is Burstable, fixed at 1 pod. ============
   {id:"celeryworker", name:"{reg}-celery-worker", ns:"{ns}", kind:"Deployment", builtBy:"registry", col:"celeryWorker", row:0,
    request:SHAPE_CORE_GUARANTEED.request, limit:SHAPE_CORE_GUARANTEED.limit, qos:"guaranteed", sizing:{kind:"celeryWorker"}, tag:"measured",
-   note:"Pod count derived from the combined Staff UI + Partner daily transaction volume (Tab 1) against the register-write + intake-ingest pipeline curves. Measured at 2 vCPU / 4 GB in the celery benchmark; standardized to the guaranteed-tier shape (2 vCPU / 2 GB) here. See celery/final-report-summary.md."},
+   note:"Pod count sized to a 12-hour drain-time goal: a day's Change Request + Intake Submission volume (Tab 1, Staff + Partner combined) populates 7 queues -- register ingest x2 (CR, Intake), ID Generation (Intake), Deduplication x2 (CR, Intake), Completion Score (CR + Intake), Score Compute (Intake) -- and that total must drain within 12 hours, checked against the real Blended benchmark run (all 14 queue types draining concurrently, not isolated per-queue curves, since that's this registry's actual situation). That benchmark's own pod-3 rate regresses below pod-2 (a documented contention issue between change_request_ingest and ingest_data sharing one beat producer) -- see CELERY_BLENDED_DRAIN_RATES; demand beyond pod-2's demonstrated drain rate is a real ceiling the benchmark found, not something more pods are shown to fix. Measured at 2 vCPU / 4 GB in the celery benchmark; standardized to the guaranteed-tier shape (2 vCPU / 2 GB) here. See celery/final-report-summary.md."},
   {id:"connectorworker", name:"registry-connector-worker", kind:"Deployment", builtBy:"commons", col:"celeryWorker", row:1,
    request:SHAPE_BURSTABLE.request, limit:SHAPE_BURSTABLE.limit, qos:"burstable", sizing:{kind:"fixed",n:1}, tag:"assumed",
    note:"Runs the connector's pipeline/sync jobs. Not yet deployed on this cluster — fixed at 1 pod, standard burstable shape."},
